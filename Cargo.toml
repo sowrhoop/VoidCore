@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "crates/service",
+    "crates/gui",
+    "crates/shared",
+    "tools/installer-builder",
+]
+
+# Workspace-level release defaults (individual crates may override)
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

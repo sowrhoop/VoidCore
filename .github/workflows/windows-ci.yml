@@ -1,0 +1,53 @@
+name: Windows CI Build & Sign
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-sign:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Install signtool prerequisites
+        run: |
+          choco install -y windows-sdk-10.0
+
+      - name: Build release
+        run: |
+          cargo build --workspace --release
+
+      - name: Create release artifacts
+        run: |
+          mkdir -p artifacts
+          cp target\x86_64-pc-windows-msvc\release\voidcore-service.exe artifacts\voidcore-service.exe || true
+          cp target\x86_64-pc-windows-msvc\release\voidcore-gui.exe artifacts\voidcore-gui.exe || true
+
+      - name: Import signing certificate
+        if: ${{ secrets.CERT_PFX && secrets.CERT_PASSWORD }}
+        env:
+          CERT_PFX: ${{ secrets.CERT_PFX }}
+          CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
+        run: |
+          echo "$CERT_PFX" | Out-File cert.pfx -Encoding ascii
+          powershell -Command "Import-PfxCertificate -FilePath cert.pfx -CertStoreLocation Cert:\CurrentUser\My -Password (ConvertTo-SecureString -String $env:CERT_PASSWORD -AsPlainText -Force)"
+
+      - name: Sign artifacts
+        if: ${{ secrets.CERT_PFX && secrets.CERT_PASSWORD }}
+        run: |
+          signtool sign /fd SHA256 /a artifacts\voidcore-service.exe || true
+          signtool sign /fd SHA256 /a artifacts\voidcore-gui.exe || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: voidcore-artifacts
+          path: artifacts
