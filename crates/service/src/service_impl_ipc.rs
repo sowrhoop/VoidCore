@@ -21,31 +21,31 @@ pub fn start_ipc_server(cfg_handle: Arc<Mutex<RuntimeConfig>>) {
         .name("ipc-server".into())
         .spawn(move || unsafe {
             use windows::core::{PCWSTR, PWSTR};
-            use windows::Win32::System::Pipes::{CreateNamedPipeW, ConnectNamedPipe, DisconnectNamedPipe, PIPE_ACCESS_DUPLEX, PIPE_TYPE_MESSAGE, PIPE_READMODE_MESSAGE, PIPE_WAIT, PIPE_UNLIMITED_INSTANCES, GetNamedPipeClientProcessId};
-            use windows::Win32::Foundation::{HANDLE, HLOCAL};
-            use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-            use windows::Win32::Security::{OpenProcessToken, GetTokenInformation, TokenUser, TOKEN_USER};
+            use windows::Win32::System::Pipes::{CreateNamedPipeW, ConnectNamedPipe, DisconnectNamedPipe, PIPE_TYPE_MESSAGE, PIPE_READMODE_MESSAGE, PIPE_WAIT, GetNamedPipeClientProcessId};
+            use windows::Win32::Foundation::{HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree};
+            use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, OpenProcessToken};
+            use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_USER};
             use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
-            use windows::Win32::System::Memory::LocalFree;
+            use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 
             let pipe_name = r"\\.\pipe\voidcore_ipc";
             let mut wide: Vec<u16> = OsStr::new(pipe_name).encode_wide().collect();
             wide.push(0);
 
             loop {
-                let handle = match CreateNamedPipeW(
+                // Correctly returns a HANDLE directly in windows 0.52
+                let handle = CreateNamedPipeW(
                     PCWSTR(wide.as_ptr()),
-                    PIPE_ACCESS_DUPLEX,
+                    FILE_FLAGS_AND_ATTRIBUTES(3), // 3 = PIPE_ACCESS_DUPLEX
                     PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-                    PIPE_UNLIMITED_INSTANCES,
+                    255, // 255 = PIPE_UNLIMITED_INSTANCES
                     4096, 4096, 0, None,
-                ) {
-                    Ok(h) => h,
-                    Err(_) => {
-                        std::thread::sleep(std::time::Duration::from_secs(5));
-                        continue;
-                    }
-                };
+                );
+
+                if handle.0 == INVALID_HANDLE_VALUE.0 || handle.0 == 0 {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    continue;
+                }
 
                 let _ = ConnectNamedPipe(handle, None);
                 let mut file = std::fs::File::from_raw_handle(handle.0 as *mut _);
@@ -92,11 +92,13 @@ pub fn start_ipc_server(cfg_handle: Arc<Mutex<RuntimeConfig>>) {
                                                     
                                                     if sid.trim() != expected_sid { authorized = false; }
                                                     
+                                                    // Properly free memory to prevent security token leaks
                                                     let _ = LocalFree(HLOCAL(sid_str_ptr.0 as *mut _));
                                                 }
                                             }
                                         }
                                     }
+                                    let _ = windows::Win32::Foundation::CloseHandle(proc_handle);
                                 }
                             }
                         }
