@@ -12,6 +12,13 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write
+      
+    # FIX: Map secrets to job-level environment variables. 
+    # This securely exposes them to the steps while allowing `if:` conditionals to evaluate them.
+    env:
+      CERT_PFX: ${{ secrets.CERT_PFX }}
+      CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
+      SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
 
     steps:
       - name: Checkout Source
@@ -29,10 +36,7 @@ jobs:
         run: cargo run --bin installer-builder --release
 
       - name: Authenticode Sign Binaries
-        if: ${{ secrets.CERT_PFX != '' && secrets.CERT_PASSWORD != '' }}
-        env:
-          CERT_PFX: ${{ secrets.CERT_PFX }}
-          CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
+        if: env.CERT_PFX != '' && env.CERT_PASSWORD != ''
         run: |
           $pfxPath = "$env:TEMP\cert.pfx"
           [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:CERT_PFX))
@@ -57,9 +61,7 @@ jobs:
         run: Compress-Archive -Path dist\voidcore_staging\* -DestinationPath voidcore-release.zip
 
       - name: Generate Ed25519 Cryptographic Signature
-        if: ${{ secrets.SIGNING_KEY != '' }}
-        env:
-          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        if: env.SIGNING_KEY != ''
         run: |
           python -c "
           import os, binascii
