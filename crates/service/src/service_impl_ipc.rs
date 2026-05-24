@@ -24,7 +24,7 @@ pub fn start_ipc_server(cfg_handle: Arc<Mutex<RuntimeConfig>>) {
             use windows::Win32::System::Pipes::{CreateNamedPipeW, ConnectNamedPipe, DisconnectNamedPipe, PIPE_TYPE_MESSAGE, PIPE_READMODE_MESSAGE, PIPE_WAIT, GetNamedPipeClientProcessId};
             use windows::Win32::Foundation::{HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree};
             use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, OpenProcessToken};
-            use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_USER};
+            use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_USER, TOKEN_ACCESS_MASK};
             use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
             use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 
@@ -76,7 +76,8 @@ pub fn start_ipc_server(cfg_handle: Arc<Mutex<RuntimeConfig>>) {
                             if GetNamedPipeClientProcessId(handle, &mut client_pid).is_ok() && client_pid != 0 {
                                 if let Ok(proc_handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, client_pid) {
                                     let mut token = HANDLE(0);
-                                    if OpenProcessToken(proc_handle, 8u32, &mut token).is_ok() {
+                                    // Wrapped the 8u32 in the required TOKEN_ACCESS_MASK type wrapper!
+                                    if OpenProcessToken(proc_handle, TOKEN_ACCESS_MASK(8u32), &mut token).is_ok() {
                                         let mut size: u32 = 0;
                                         let _ = GetTokenInformation(token, TokenUser, None, 0, &mut size);
                                         if size > 0 {
