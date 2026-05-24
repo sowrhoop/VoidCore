@@ -29,23 +29,35 @@ jobs:
         run: cargo run --bin installer-builder --release
 
       - name: Authenticode Sign Binaries
-        if: env.CERT_PFX != '' && env.CERT_PASSWORD != ''
+        if: ${{ secrets.CERT_PFX != '' && secrets.CERT_PASSWORD != '' }}
         env:
           CERT_PFX: ${{ secrets.CERT_PFX }}
           CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
         run: |
           $pfxPath = "$env:TEMP\cert.pfx"
           [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:CERT_PFX))
-          # Sign Service and GUI Binaries
-          signtool sign /f $pfxPath /p $env:CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 target\release\voidcore-service.exe
-          signtool sign /f $pfxPath /p $env:CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 target\release\voidcore-gui.exe
+          
+          # signtool.exe is installed via Windows SDK but is NOT in the default system PATH.
+          # We dynamically search the SDK directory to find the x64 binary.
+          $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "signtool.exe" | Where-Object { $_.FullName -match "\\x64\\" } | Select-Object -First 1).FullName
+          
+          if (-not $signtool) {
+              Write-Error "Could not locate signtool.exe in the Windows SDK."
+              exit 1
+          }
+          Write-Host "Using signtool at: $signtool"
+          
+          # Sign Service and GUI Binaries using the dynamically resolved path
+          & $signtool sign /f $pfxPath /p $env:CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 target\release\voidcore-service.exe
+          & $signtool sign /f $pfxPath /p $env:CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 target\release\voidcore-gui.exe
+          
           Remove-Item $pfxPath
 
       - name: Package Staged Release
         run: Compress-Archive -Path dist\voidcore_staging\* -DestinationPath voidcore-release.zip
 
       - name: Generate Ed25519 Cryptographic Signature
-        if: env.SIGNING_KEY != ''
+        if: ${{ secrets.SIGNING_KEY != '' }}
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
         run: |
@@ -55,7 +67,6 @@ jobs:
           key_hex = os.environ.get('SIGNING_KEY', '')
           if key_hex:
               priv_key = ed25519.Ed25519PrivateKey.from_private_bytes(binascii.unhexlify(key_hex))
-              # Sign the main service executable for the auto-updater
               with open(r'target\release\voidcore-service.exe', 'rb') as f:
                   data = f.read()
               signature = priv_key.sign(data)
