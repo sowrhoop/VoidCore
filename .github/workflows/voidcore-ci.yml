@@ -13,8 +13,6 @@ jobs:
     permissions:
       contents: write
       
-    # FIX: Map secrets to job-level environment variables. 
-    # This securely exposes them to the steps while allowing `if:` conditionals to evaluate them.
     env:
       CERT_PFX: ${{ secrets.CERT_PFX }}
       CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
@@ -59,6 +57,10 @@ jobs:
 
       - name: Package Staged Release
         run: Compress-Archive -Path dist\voidcore_staging\* -DestinationPath voidcore-release.zip
+
+      - name: Install Python Dependencies for Signing
+        if: env.SIGNING_KEY != ''
+        run: python -m pip install --upgrade pip cryptography
 
       - name: Generate Ed25519 Cryptographic Signature
         if: env.SIGNING_KEY != ''
