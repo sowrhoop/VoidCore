@@ -78,9 +78,25 @@ jobs:
                   f.write(signature)
           "
 
+      - name: Determine Release Tag
+        shell: bash
+        run: |
+          # If this was triggered by a real git tag (e.g. v1.0.0), use it.
+          # Otherwise (manual run), generate a dynamic development tag.
+          if [ "${{ github.ref_type }}" == "tag" ]; then
+            echo "TAG_NAME=${{ github.ref_name }}" >> $GITHUB_ENV
+            echo "IS_PRERELEASE=false" >> $GITHUB_ENV
+          else
+            echo "TAG_NAME=dev-build-${{ github.run_number }}" >> $GITHUB_ENV
+            echo "IS_PRERELEASE=true" >> $GITHUB_ENV
+          fi
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v1
         with:
+          tag_name: ${{ env.TAG_NAME }}
+          prerelease: ${{ env.IS_PRERELEASE }}
+          name: Release ${{ env.TAG_NAME }}
           files: |
             voidcore-release.zip
             target/release/voidcore-service.exe
