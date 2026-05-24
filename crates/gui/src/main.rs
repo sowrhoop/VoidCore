@@ -17,7 +17,7 @@ fn main() {
     let pipe_name = to_wide(r"\\.\pipe\voidcore_ipc");
 
     unsafe {
-        let handle = CreateFileW(
+        let handle_result = CreateFileW(
             PCWSTR(pipe_name.as_ptr()),
             0x40000000 | 0x80000000, // GENERIC_WRITE | GENERIC_READ
             FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -27,12 +27,15 @@ fn main() {
             None,
         );
 
-        if handle.0 == 0 || handle.0 == INVALID_HANDLE_VALUE.0 {
-            let title = HSTRING::from("VoidCore Interface");
-            let body = HSTRING::from("Error: Could not connect to the VoidCore Background Daemon.\nMake sure the service is running.");
-            let _ = MessageBoxW(None, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
-            return;
-        }
+        let handle = match handle_result {
+            Ok(h) if h.0 != 0 && h.0 != INVALID_HANDLE_VALUE.0 => h,
+            _ => {
+                let title = HSTRING::from("VoidCore Interface");
+                let body = HSTRING::from("Error: Could not connect to the VoidCore Background Daemon.\nMake sure the service is running.");
+                let _ = MessageBoxW(None, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
+                return;
+            }
+        };
 
         let mut file = std::fs::File::from_raw_handle(handle.0 as *mut _);
         
