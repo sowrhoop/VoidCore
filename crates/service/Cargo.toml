@@ -14,7 +14,10 @@ ed25519-dalek = "2.1"
 hex = "0.4"
 log = "0.4"
 eventlog = "0.2"
-windows = { version = "0.52", features = [
+
+[dependencies.windows]
+version = "0.52"
+features = [
     "Win32_Foundation",
     "Win32_System_Services",
     "Win32_System_ProcessStatus",
@@ -22,13 +25,10 @@ windows = { version = "0.52", features = [
     "Win32_Security",
     "Win32_NetworkManagement_NetManagement",
     "Win32_System_Registry",
-    "Win32_UI_WindowsAndMessaging",
-]}
+    "Win32_System_Pipes",
+    "Win32_System_Memory",
+    "Win32_UI_WindowsAndMessaging"
+]
 
-# Reuse shared crate for config types
-voidcore-shared = { path = "../shared" }
-
-[lib]
-name = "service_impl"
-path = "src/service_impl.rs"
-crate-type = ["cdylib"]
+[dependencies.voidcore-shared]
+path = "../shared"

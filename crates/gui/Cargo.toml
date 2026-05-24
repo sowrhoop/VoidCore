@@ -4,5 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-windows = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }
 voidcore-shared = { path = "../shared" }
+
+[dependencies.windows]
+version = "0.52"
+features = [
+    "Win32_Foundation", 
+    "Win32_UI_WindowsAndMessaging", 
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes"
+]

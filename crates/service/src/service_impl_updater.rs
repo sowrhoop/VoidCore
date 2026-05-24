@@ -1,14 +1,12 @@
 use std::error::Error;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-
+use std::ffi::OsStr;
+use std::os::windows::ffi::OsStrExt;
 use ed25519_dalek::{Signature, VerifyingKey};
-use hex;
-
 use voidcore_shared::RuntimeConfig;
 
 #[derive(serde::Deserialize, Debug)]
@@ -29,23 +27,19 @@ pub fn start_auto_updater(cfg_handle: Arc<Mutex<RuntimeConfig>>) {
     thread::Builder::new()
         .name("auto-updater".into())
         .spawn(move || {
-            // Attempt update immediately on startup
             let _ = attempt_update(&cfg_handle);
 
             loop {
-                // Sleep then poll
                 for _ in 0..(3600 / 15) {
                     thread::sleep(Duration::from_secs(15));
                     let flag = Path::new(INSTALL_DIR).join("update.flag");
                     if flag.exists() {
                         let _ = fs::remove_file(&flag);
                         if let Ok(true) = attempt_update(&cfg_handle) {
-                            // new binary written — restart service
                             std::process::exit(1);
                         }
                     }
                 }
-
                 if let Ok(true) = attempt_update(&cfg_handle) {
                     std::process::exit(1);
                 }
@@ -68,47 +62,27 @@ fn check_and_apply_update(cfg: &RuntimeConfig) -> Result<bool, Box<dyn Error + S
     };
 
     let release: GithubRelease = serde_json::from_reader(response.into_reader())?;
-
-    let current_v: u32 = cfg.version_code;
     let remote_v: u32 = release.tag_name.trim_start_matches("v1.0.").parse().unwrap_or(0);
 
-    if remote_v <= current_v {
+    if remote_v <= cfg.version_code {
         return Ok(false);
     }
 
-    // Choose asset name
-    let exe_asset = release
-        .assets
-        .iter()
-        .find(|a| a.name == "voidcore-service.exe" || a.name == "voidcore.exe")
+    let exe_asset = release.assets.iter()
+        .find(|a| a.name == "voidcore-service.exe")
         .ok_or("Release has no service exe asset")?;
 
-    // Find signature asset
-    let sig_asset = release
-        .assets
-        .iter()
-        .find(|a| a.name == format!("{}.sig", exe_asset.name) || a.name.ends_with(".sig"))
+    let sig_asset = release.assets.iter()
+        .find(|a| a.name == format!("{}.sig", exe_asset.name))
         .ok_or("Release has no signature asset")?;
 
-    // Download binary
     let mut exe_bytes = Vec::new();
-    ureq::get(&exe_asset.browser_download_url)
-        .set("User-Agent", "VoidCore-Service/1.0")
-        .call()?
-        .into_reader()
-        .read_to_end(&mut exe_bytes)?;
+    ureq::get(&exe_asset.browser_download_url).call()?.into_reader().read_to_end(&mut exe_bytes)?;
 
-    // Download signature
     let mut sig_bytes = Vec::new();
-    ureq::get(&sig_asset.browser_download_url)
-        .set("User-Agent", "VoidCore-Service/1.0")
-        .call()?
-        .into_reader()
-        .read_to_end(&mut sig_bytes)?;
+    ureq::get(&sig_asset.browser_download_url).call()?.into_reader().read_to_end(&mut sig_bytes)?;
 
-    if sig_bytes.len() < 64 {
-        return Err("Signature file too short".into());
-    }
+    if sig_bytes.len() < 64 { return Err("Signature file too short".into()); }
 
     let pub_bytes = hex::decode(&cfg.pubkey_hex)?;
     let pub_array: [u8; 32] = pub_bytes.as_slice().try_into().map_err(|_| "Public key must be 32 bytes")?;
@@ -117,31 +91,22 @@ fn check_and_apply_update(cfg: &RuntimeConfig) -> Result<bool, Box<dyn Error + S
     let sig_array: [u8; 64] = sig_bytes[..64].try_into().map_err(|_| "Signature must be 64 bytes")?;
     let signature = Signature::from_bytes(&sig_array)?;
 
-    public_key.verify(&exe_bytes, &signature).map_err(|_| "Signature verification FAILED — update rejected")?;
+    public_key.verify(&exe_bytes, &signature).map_err(|_| "Signature verification FAILED")?;
 
-    // Atomic replacement
     let target = Path::new(INSTALL_DIR).join(&exe_asset.name);
     let old = Path::new(INSTALL_DIR).join(format!("{}.old", &exe_asset.name));
     let staging = Path::new(INSTALL_DIR).join(format!("{}.new", &exe_asset.name));
 
     fs::write(&staging, &exe_bytes)?;
-
     let _ = fs::remove_file(&old);
-    if target.exists() {
-        fs::rename(&target, &old)?;
-    }
-
+    if target.exists() { fs::rename(&target, &old)?; }
+    
     if let Err(e) = fs::rename(&staging, &target) {
-        // Rollback
-        if old.exists() {
-            let _ = fs::rename(&old, &target);
-        }
+        if old.exists() { let _ = fs::rename(&old, &target); }
         return Err(e.into());
     }
 
-    // Update registry version (anti-rollback)
     write_registry_version(cfg.version_code);
-
     Ok(true)
 }
 
@@ -149,31 +114,13 @@ fn write_registry_version(version: u32) {
     unsafe {
         use windows::Win32::System::Registry::{RegCreateKeyExW, RegSetValueExW, HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, REG_DWORD, REG_OPTION_NON_VOLATILE};
         use windows::core::PCWSTR;
-        let subkey = "SOFTWARE\\VoidCore";
-        let subkey_h = widestring::U16CString::from_str(subkey).unwrap();
+        
+        let subkey_w: Vec<u16> = OsStr::new("SOFTWARE\\VoidCore").encode_wide().chain(std::iter::once(0)).collect();
+        let val_w: Vec<u16> = OsStr::new("SecureVersion").encode_wide().chain(std::iter::once(0)).collect();
+        
         let mut hkey = Default::default();
-        if RegCreateKeyExW(
-            HKEY_LOCAL_MACHINE,
-            PCWSTR(subkey_h.as_ptr()),
-            0,
-            PCWSTR::null(),
-            REG_OPTION_NON_VOLATILE,
-            KEY_ALL_ACCESS,
-            None,
-            &mut hkey,
-            None,
-        )
-        .is_ok()
-        {
-            let val = "SecureVersion";
-            let val_h = widestring::U16CString::from_str(val).unwrap();
-            let _ = RegSetValueExW(
-                hkey,
-                PCWSTR(val_h.as_ptr()),
-                0,
-                REG_DWORD,
-                Some(std::slice::from_raw_parts(&version as *const u32 as *const u8, 4)),
-            );
+        if RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(subkey_w.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey, None).is_ok() {
+            let _ = RegSetValueExW(hkey, PCWSTR(val_w.as_ptr()), 0, REG_DWORD, Some(std::slice::from_raw_parts(&version as *const u32 as *const u8, 4)));
         }
     }
 }

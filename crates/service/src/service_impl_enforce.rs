@@ -1,61 +1,72 @@
 use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::os::windows::ffi::OsStrExt;
 use std::thread;
 use std::time::Duration;
-use std::fs;
 use voidcore_shared::RuntimeConfig;
 use wmi::{COMLibrary, WMIConnection};
 use serde::Deserialize;
+use windows::core::PCWSTR;
 use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::System::ProcessStatus::K32GetProcessImageFileNameW;
+use windows::Win32::NetworkManagement::NetManagement::{NetUserSetInfo, USER_INFO_1003};
+use windows::Win32::System::Registry::{RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, REG_SZ, REG_OPTION_NON_VOLATILE};
+
+// Missing Struct Added
+#[allow(non_camel_case_types)]
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "PascalCase")]
+struct Win32_ProcessStartTrace {
+    process_name: String,
+    process_id: u32,
+}
+
+fn to_wide(s: &str) -> Vec<u16> {
+    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+}
 
 pub fn start_enforcement(cfg_handle: std::sync::Arc<std::sync::Mutex<RuntimeConfig>>) {
-    // WMI watcher thread (placeholder) — the full WMI logic will be ported
     thread::Builder::new()
         .name("wmi-watcher".into())
         .spawn(move || {
-            // Initialize COM and WMI
             let com = match COMLibrary::new() {
                 Ok(c) => c,
-                Err(_) => return,
+                Err(_) => {
+                    thread::sleep(Duration::from_secs(5));
+                    COMLibrary::new().expect("COM initialization failed fatally")
+                }
             };
-            let wmi_con = match WMIConnection::new(com) {
-                Ok(w) => w,
-                Err(_) => return,
-            };
-
-            // Listen for process start traces
+            
+            let wmi_con = WMIConnection::new(com).unwrap();
             if let Ok(iterator) = wmi_con.notification::<Win32_ProcessStartTrace>() {
                 for result in iterator {
                     if let Ok(trace) = result {
                         let name_lower = trace.process_name.to_lowercase().trim_end_matches(".exe").to_string();
                         let whitelist: HashSet<String> = cfg_handle.lock().map(|c| c.whitelist.clone()).unwrap_or_default();
 
-                        // Skip critical system processes
-                        let critical = ["system","smss","csrss","wininit","winlogon","lsass","services","svchost","explorer","voidcore"];
+                        let critical = ["system","smss","csrss","wininit","winlogon","lsass","services","svchost","explorer","voidcore-service", "voidcore-gui"];
                         if critical.contains(&name_lower.as_str()) {
                             continue;
                         }
 
-                        // If not whitelisted, check path-based trusted locations first
-                        let mut allow = false;
-                        if whitelist.contains(&name_lower) {
-                            allow = true;
-                        } else {
-                            // Attempt to resolve process path
+                        let mut allow = whitelist.contains(&name_lower);
+                        
+                        if !allow {
                             unsafe {
                                 if let Ok(proc_handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, trace.process_id) {
                                     let mut buffer = [0u16; 1024];
                                     let len = K32GetProcessImageFileNameW(proc_handle, &mut buffer);
                                     let _ = windows::Win32::Foundation::CloseHandle(proc_handle);
+                                    
                                     if len > 0 {
                                         let path = String::from_utf16_lossy(&buffer[..len as usize]).to_lowercase();
-                                        // Trusted user paths
+                                        // Fixed erroneous path structures
                                         let trusted_paths = [
-                                            "\\\appdata\\local\\programs\\",
-                                            "\\\appdata\\roaming\\npm\\",
-                                            "\\\appdata\\local\\npm\\",
-                                            "\\\bravesoftware\\",
-                                            "\\\vscodium\\",
+                                            "\\appdata\\local\\programs\\",
+                                            "\\appdata\\roaming\\npm\\",
+                                            "\\appdata\\local\\npm\\",
+                                            "\\bravesoftware\\",
+                                            "\\vscodium\\",
                                         ];
                                         for tp in &trusted_paths {
                                             if path.contains(tp) {
@@ -69,7 +80,6 @@ pub fn start_enforcement(cfg_handle: std::sync::Arc<std::sync::Mutex<RuntimeConf
                         }
 
                         if !allow {
-                            // Terminate process by PID
                             unsafe {
                                 if let Ok(handle) = OpenProcess(PROCESS_TERMINATE, false, trace.process_id) {
                                     let _ = TerminateProcess(handle, 1);
@@ -83,70 +93,48 @@ pub fn start_enforcement(cfg_handle: std::sync::Arc<std::sync::Mutex<RuntimeConf
         })
         .ok();
 
-    // Firewall sync thread (placeholder)
-    thread::Builder::new()
-        .name("firewall-sync".into())
-        .spawn(move || {
-            loop {
-                // Resolve blocklist IPs and apply firewall rules
-                thread::sleep(Duration::from_secs(6 * 3600));
-            }
-        })
-        .ok();
-
-    // Main enforcement tick: password rotation, hosts rewrite, policies
     thread::Builder::new()
         .name("main-enforce".into())
         .spawn(move || {
             loop {
-                // Rotate LAPS password, enforce DNS/policies, write hosts file
-                // Implement hosts file and chromium policy enforcement using runtime config
                 let cfg = cfg_handle.lock().map(|c| c.clone()).unwrap_or_default();
                 write_hosts_file(&cfg.url_blocklist);
                 write_chromium_policies(&cfg.url_blocklist);
-                // Rotate VoidCoreAdmin password and purge other admins
                 rotate_local_admin_password();
                 purge_all_other_administrators();
-                thread::sleep(Duration::from_secs(10 * 60)); // every 10 minutes
+                thread::sleep(Duration::from_secs(10 * 60)); 
             }
         })
         .ok();
 }
 
 fn rotate_local_admin_password() {
-    // Use NetUserSetInfo via windows API to set VoidCoreAdmin's password
     use rand::Rng;
-    use windows::core::PCWSTR;
-    use windows::Win32::NetworkManagement::NetManagement::{NetUserSetInfo, USER_INFO_1003};
-
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+[]{}|;:,.<>?/";
     let mut rng = rand::thread_rng();
-    let pass: String = (0..127).map(|_| {
-        let idx = rng.gen_range(0..CHARSET.len());
-        CHARSET[idx] as char
-    }).collect();
+    let pass: String = (0..127).map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char).collect();
 
-    let user_h = widestring::U16CString::from_str("VoidCoreAdmin").unwrap();
-    let pass_h = widestring::U16CString::from_str(&pass).unwrap();
-    let mut info = USER_INFO_1003 { usri1003_password: windows::Win32::Foundation::PWSTR(pass_h.as_ptr() as *mut _) };
+    let user_w = to_wide("VoidCoreAdmin");
+    let pass_w = to_wide(&pass);
+    
+    let mut info = USER_INFO_1003 { usri1003_password: windows::Win32::Foundation::PWSTR(pass_w.as_ptr() as *mut _) };
     unsafe {
-        let _ = NetUserSetInfo(PCWSTR(std::ptr::null()), PCWSTR(user_h.as_ptr()), 1003, &mut info as *mut _ as *mut u8, None);
+        let _ = NetUserSetInfo(PCWSTR::null(), PCWSTR(user_w.as_ptr()), 1003, &mut info as *mut _ as *mut u8, None);
     }
 }
 
 fn purge_all_other_administrators() {
     let ps = r#"
-        $admins = Get-LocalGroupMember -Group 'Administrators' |
-                  Where-Object { $_.ObjectClass -eq 'User' }
+        $admins = Get-LocalGroupMember -Group 'Administrators' | Where-Object { $_.ObjectClass -eq 'User' }
         foreach ($a in $admins) {
-            $name = $a.Name -replace '.*\\',''  # strip domain prefix
+            $name = $a.Name -replace '.*\\',''
             if ($name -ne 'VoidCoreAdmin' -and $name -ne 'Administrator') {
-                Add-LocalGroupMember    -Group 'Users'          -Member $a.Name -ErrorAction SilentlyContinue
+                Add-LocalGroupMember -Group 'Users' -Member $a.Name -ErrorAction SilentlyContinue
                 Remove-LocalGroupMember -Group 'Administrators' -Member $a.Name -ErrorAction SilentlyContinue
             }
         }
     "#;
-    let _ = std::process::Command::new("powershell").args(["-NoProfile","-NonInteractive","-Command", ps]).output();
+    let _ = std::process::Command::new("powershell").args(["-NoProfile","-NonInteractive","-WindowStyle","Hidden","-Command", ps]).output();
 }
 
 fn write_hosts_file(blocklist: &std::collections::HashSet<String>) {
@@ -181,31 +169,29 @@ fn write_hosts_file(blocklist: &std::collections::HashSet<String>) {
 }
 
 fn write_chromium_policies(blocklist: &std::collections::HashSet<String>) {
-    use windows::core::HSTRING;
-    use windows::Win32::System::Registry::{RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, REG_SZ, REG_OPTION_NON_VOLATILE};
-
     let browsers = [
-        (r"SOFTWARE\Policies\Google\Chrome", r"SOFTWARE\Policies\Google\Chrome\URLBlocklist", "IncognitoModeAvailability"),
-        (r"SOFTWARE\Policies\BraveSoftware\Brave", r"SOFTWARE\Policies\BraveSoftware\Brave\URLBlocklist", "IncognitoModeAvailability"),
-        (r"SOFTWARE\Policies\Microsoft\Edge", r"SOFTWARE\Policies\Microsoft\Edge\URLBlocklist", "InPrivateModeAvailability"),
+        ("SOFTWARE\\Policies\\Google\\Chrome", "SOFTWARE\\Policies\\Google\\Chrome\\URLBlocklist", "IncognitoModeAvailability"),
+        ("SOFTWARE\\Policies\\BraveSoftware\\Brave", "SOFTWARE\\Policies\\BraveSoftware\\Brave\\URLBlocklist", "IncognitoModeAvailability"),
+        ("SOFTWARE\\Policies\\Microsoft\\Edge", "SOFTWARE\\Policies\\Microsoft\\Edge\\URLBlocklist", "InPrivateModeAvailability"),
     ];
 
     unsafe {
         for (policy_path, blocklist_path, _incognito_key) in &browsers {
-            let subkey_h = HSTRING::from(*policy_path);
+            let subkey_w = to_wide(*policy_path);
             let mut hkey = Default::default();
-            let _ = RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(subkey_h.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey, None);
+            let _ = RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(subkey_w.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey, None);
 
-            // Delete old blocklist and recreate
-            let bl_h = HSTRING::from(*blocklist_path);
-            let _ = RegDeleteTreeW(HKEY_LOCAL_MACHINE, PCWSTR(bl_h.as_ptr()));
+            let bl_w = to_wide(*blocklist_path);
+            let _ = RegDeleteTreeW(HKEY_LOCAL_MACHINE, PCWSTR(bl_w.as_ptr()));
+            
             let mut hkey_block = Default::default();
-            if RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(bl_h.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey_block, None).is_ok() {
+            if RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(bl_w.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey_block, None).is_ok() {
                 for (index, domain) in blocklist.iter().enumerate() {
-                    let val_num_h = HSTRING::from((index + 1).to_string());
-                    let pattern_h = HSTRING::from(format!("*{}*", domain));
-                    let pattern_bytes = std::slice::from_raw_parts(pattern_h.as_ptr() as *const u8, (pattern_h.len() + 1) * 2);
-                    let _ = RegSetValueExW(hkey_block, PCWSTR(val_num_h.as_ptr()), 0, REG_SZ, Some(pattern_bytes));
+                    let val_num_w = to_wide(&(index + 1).to_string());
+                    let pattern_w = to_wide(&format!("*{}*", domain));
+                    
+                    let pattern_bytes = std::slice::from_raw_parts(pattern_w.as_ptr() as *const u8, pattern_w.len() * 2);
+                    let _ = RegSetValueExW(hkey_block, PCWSTR(val_num_w.as_ptr()), 0, REG_SZ, Some(pattern_bytes));
                 }
             }
         }
