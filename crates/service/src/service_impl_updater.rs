@@ -6,7 +6,7 @@ use std::thread;
 use std::time::Duration;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey, Verifier};
 use voidcore_shared::RuntimeConfig;
 
 #[derive(serde::Deserialize, Debug)]
@@ -89,7 +89,9 @@ fn check_and_apply_update(cfg: &RuntimeConfig) -> Result<bool, Box<dyn Error + S
     let public_key = VerifyingKey::from_bytes(&pub_array)?;
 
     let sig_array: [u8; 64] = sig_bytes[..64].try_into().map_err(|_| "Signature must be 64 bytes")?;
-    let signature = Signature::from_bytes(&sig_array)?;
+    
+    // Corrected to directly bind without `?`
+    let signature = Signature::from_bytes(&sig_array);
 
     public_key.verify(&exe_bytes, &signature).map_err(|_| "Signature verification FAILED")?;
 

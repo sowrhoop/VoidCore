@@ -6,13 +6,12 @@ use std::time::Duration;
 use voidcore_shared::RuntimeConfig;
 use wmi::{COMLibrary, WMIConnection};
 use serde::Deserialize;
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::System::ProcessStatus::K32GetProcessImageFileNameW;
 use windows::Win32::NetworkManagement::NetManagement::{NetUserSetInfo, USER_INFO_1003};
 use windows::Win32::System::Registry::{RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, REG_SZ, REG_OPTION_NON_VOLATILE};
 
-// Missing Struct Added
 #[allow(non_camel_case_types)]
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "PascalCase")]
@@ -26,6 +25,7 @@ fn to_wide(s: &str) -> Vec<u16> {
 }
 
 pub fn start_enforcement(cfg_handle: std::sync::Arc<std::sync::Mutex<RuntimeConfig>>) {
+    let cfg_handle_wmi = cfg_handle.clone();
     thread::Builder::new()
         .name("wmi-watcher".into())
         .spawn(move || {
@@ -42,7 +42,7 @@ pub fn start_enforcement(cfg_handle: std::sync::Arc<std::sync::Mutex<RuntimeConf
                 for result in iterator {
                     if let Ok(trace) = result {
                         let name_lower = trace.process_name.to_lowercase().trim_end_matches(".exe").to_string();
-                        let whitelist: HashSet<String> = cfg_handle.lock().map(|c| c.whitelist.clone()).unwrap_or_default();
+                        let whitelist: HashSet<String> = cfg_handle_wmi.lock().map(|c| c.whitelist.clone()).unwrap_or_default();
 
                         let critical = ["system","smss","csrss","wininit","winlogon","lsass","services","svchost","explorer","voidcore-service", "voidcore-gui"];
                         if critical.contains(&name_lower.as_str()) {
@@ -60,7 +60,6 @@ pub fn start_enforcement(cfg_handle: std::sync::Arc<std::sync::Mutex<RuntimeConf
                                     
                                     if len > 0 {
                                         let path = String::from_utf16_lossy(&buffer[..len as usize]).to_lowercase();
-                                        // Fixed erroneous path structures
                                         let trusted_paths = [
                                             "\\appdata\\local\\programs\\",
                                             "\\appdata\\roaming\\npm\\",
@@ -89,15 +88,16 @@ pub fn start_enforcement(cfg_handle: std::sync::Arc<std::sync::Mutex<RuntimeConf
                         }
                     }
                 }
-            }
+            }; // Semicolon here explicitly releases the WMI iterator borrow before context destruction
         })
         .ok();
 
+    let cfg_handle_main = cfg_handle.clone();
     thread::Builder::new()
         .name("main-enforce".into())
         .spawn(move || {
             loop {
-                let cfg = cfg_handle.lock().map(|c| c.clone()).unwrap_or_default();
+                let cfg = cfg_handle_main.lock().map(|c| c.clone()).unwrap_or_default();
                 write_hosts_file(&cfg.url_blocklist);
                 write_chromium_policies(&cfg.url_blocklist);
                 rotate_local_admin_password();
@@ -115,9 +115,10 @@ fn rotate_local_admin_password() {
     let pass: String = (0..127).map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char).collect();
 
     let user_w = to_wide("VoidCoreAdmin");
-    let pass_w = to_wide(&pass);
+    let mut pass_w = to_wide(&pass);
     
-    let mut info = USER_INFO_1003 { usri1003_password: windows::Win32::Foundation::PWSTR(pass_w.as_ptr() as *mut _) };
+    // Correct mapping of PWSTR taking the mutable raw pointer to the U16 buffer string
+    let mut info = USER_INFO_1003 { usri1003_password: PWSTR(pass_w.as_mut_ptr()) };
     unsafe {
         let _ = NetUserSetInfo(PCWSTR::null(), PCWSTR(user_w.as_ptr()), 1003, &mut info as *mut _ as *mut u8, None);
     }
