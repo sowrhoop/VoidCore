@@ -123,8 +123,7 @@ mod service_impl_enforce {
     use wmi::{COMLibrary, WMIConnection};
     use serde::Deserialize;
     use windows::core::{PCWSTR, PWSTR};
-    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE, PROCESS_QUERY_LIMITED_INFORMATION};
-    use windows::Win32::System::ProcessStatus::K32GetProcessImageFileNameW;
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, PROCESS_NAME_WIN32};
     use windows::Win32::NetworkManagement::NetManagement::{NetUserSetInfo, USER_INFO_1003};
     use windows::Win32::System::Registry::{RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, REG_SZ, REG_OPTION_NON_VOLATILE};
 
@@ -138,6 +137,27 @@ mod service_impl_enforce {
 
     fn to_wide(s: &str) -> Vec<u16> {
         OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// Evaluates the digital signature of an executable using the Windows CryptoAPI.
+    /// Returns the Subject Name only if the signature is cryptographically valid.
+    fn get_authenticode_publisher(path: &str) -> Option<String> {
+        let script = format!(
+            "$s = Get-AuthenticodeSignature -LiteralPath '{}'; if ($s.Status -eq 'Valid') {{ $s.SignerCertificate.Subject }}",
+            path.replace("'", "''") // Securely escape single quotes in path
+        );
+        let output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
+            .output()
+            .ok()?;
+            
+        if output.status.success() {
+            let subject = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !subject.is_empty() && subject != "INVALID" {
+                return Some(subject);
+            }
+        }
+        None
     }
 
     pub fn start_enforcement(cfg_handle: std::sync::Arc<std::sync::Mutex<RuntimeConfig>>) {
@@ -158,7 +178,7 @@ mod service_impl_enforce {
                     for result in iterator {
                         if let Ok(trace) = result {
                             let name_lower = trace.process_name.to_lowercase().trim_end_matches(".exe").to_string();
-                            let whitelist: HashSet<String> = cfg_handle_wmi.lock().map(|c| c.whitelist.clone()).unwrap_or_default();
+                            let cfg = cfg_handle_wmi.lock().map(|c| c.clone()).unwrap_or_default();
                             
                             let mut allow = false;
 
@@ -168,23 +188,27 @@ mod service_impl_enforce {
                             }
 
                             unsafe {
-                                if let Ok(proc_handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, trace.process_id) {
+                                // Open handle with BOTH Query and Terminate rights up front.
+                                if let Ok(proc_handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, false, trace.process_id) {
                                     let mut buffer = [0u16; 1024];
-                                    let len = K32GetProcessImageFileNameW(proc_handle, &mut buffer);
-                                    let _ = windows::Win32::Foundation::CloseHandle(proc_handle);
+                                    let mut size = buffer.len() as u32;
                                     
-                                    if len > 0 {
-                                        let path = String::from_utf16_lossy(&buffer[..len as usize]).to_lowercase();
+                                    // QueryFullProcessImageNameW gets the true DOS path (C:\...) required for signature verification
+                                    if QueryFullProcessImageNameW(proc_handle, PROCESS_NAME_WIN32, PWSTR(buffer.as_mut_ptr()), &mut size).is_ok() {
+                                        let path = String::from_utf16_lossy(&buffer[..size as usize]);
+                                        let path_lower = path.to_lowercase();
                                         
-                                        if path.contains("\\windows\\system32\\") || 
-                                           path.contains("\\windows\\syswow64\\") || 
-                                           path.contains("\\windows\\systemapps\\") ||
-                                           path.contains("\\windows\\immersivecontrolpanel\\") ||
-                                           path.contains("\\windows\\explorer.exe") ||
-                                           path.contains("\\program files\\windowsapps\\") {
+                                        // SMART ZONE 1: Immutable Windows Paths
+                                        if path_lower.contains("\\windows\\system32\\") || 
+                                           path_lower.contains("\\windows\\syswow64\\") || 
+                                           path_lower.contains("\\windows\\systemapps\\") ||
+                                           path_lower.contains("\\windows\\immersivecontrolpanel\\") ||
+                                           path_lower.contains("\\windows\\explorer.exe") ||
+                                           path_lower.contains("\\program files\\windowsapps\\") {
                                             allow = true;
                                         }
 
+                                        // SMART ZONE 2: Trusted Developer AppData Paths
                                         let trusted_paths = [
                                             "\\appdata\\local\\programs\\",
                                             "\\appdata\\roaming\\npm\\",
@@ -193,32 +217,45 @@ mod service_impl_enforce {
                                             "\\vscodium\\",
                                         ];
                                         for tp in &trusted_paths {
-                                            if path.contains(tp) {
+                                            if path_lower.contains(tp) {
                                                 allow = true;
                                                 break;
                                             }
                                         }
-                                    }
-                                }
-                            }
 
-                            let junk = ["steam", "epicgameslauncher", "xboxapp", "gamebar", "riotclient"];
-                            for j in &junk {
-                                if name_lower.contains(j) {
-                                    allow = false;
-                                }
-                            }
+                                        // JUNK OVERRIDE: Block gaming platforms from impersonating anything
+                                        let junk = ["steam", "epicgameslauncher", "xboxapp", "gamebar", "riotclient"];
+                                        for j in &junk {
+                                            if name_lower.contains(j) {
+                                                allow = false;
+                                            }
+                                        }
 
-                            if !allow && whitelist.contains(&name_lower) {
-                                allow = true;
-                            }
-                            
-                            if !allow {
-                                unsafe {
-                                    if let Ok(handle) = OpenProcess(PROCESS_TERMINATE, false, trace.process_id) {
-                                        let _ = TerminateProcess(handle, 1);
-                                        let _ = windows::Win32::Foundation::CloseHandle(handle);
+                                        // NAME WHITELIST: Direct Name Matches
+                                        if !allow && cfg.whitelist.contains(&name_lower) {
+                                            allow = true;
+                                        }
+                                        
+                                        // SMART ZONE 3: ZERO-TRUST AUTHENTICODE VALIDATION
+                                        // If an unwhitelisted process tries to run, check its digital signature!
+                                        if !allow && !cfg.trusted_publishers.is_empty() {
+                                            if let Some(subject) = get_authenticode_publisher(&path) {
+                                                let subject_lower = subject.to_lowercase();
+                                                for pub_name in &cfg.trusted_publishers {
+                                                    if subject_lower.contains(&pub_name.to_lowercase()) {
+                                                        allow = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
+
+                                    // EXECUTION: Terminate using the exact same handle if it failed all checks
+                                    if !allow {
+                                        let _ = TerminateProcess(proc_handle, 1);
+                                    }
+                                    let _ = windows::Win32::Foundation::CloseHandle(proc_handle);
                                 }
                             }
                         }
@@ -371,7 +408,6 @@ mod service_impl_ipc {
                 let mut wide: Vec<u16> = OsStr::new(pipe_name).encode_wide().collect();
                 wide.push(0);
 
-                // SDDL: Discretionary ACL (D:) granting Generic All (GA) to Everyone (WD)
                 let sddl_str = r"D:(A;;GA;;;WD)";
                 let mut sddl_wide: Vec<u16> = OsStr::new(sddl_str).encode_wide().collect();
                 sddl_wide.push(0);
@@ -384,7 +420,6 @@ mod service_impl_ipc {
                         bInheritHandle: windows::Win32::Foundation::BOOL(0),
                     };
 
-                    // Convert the SDDL string to a raw Security Descriptor
                     if ConvertStringSecurityDescriptorToSecurityDescriptorW(
                         PCWSTR(sddl_wide.as_ptr()),
                         SDDL_REVISION_1,
@@ -394,7 +429,6 @@ mod service_impl_ipc {
                         sa.lpSecurityDescriptor = sd.0;
                     }
 
-                    // Pass the Security Attributes to allow cross-privilege communication
                     let handle = CreateNamedPipeW(
                         PCWSTR(wide.as_ptr()),
                         FILE_FLAGS_AND_ATTRIBUTES(3),

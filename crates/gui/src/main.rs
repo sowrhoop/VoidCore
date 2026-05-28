@@ -1,7 +1,7 @@
 #![windows_subsystem = "windows"] // Launch without a console window
 
 use std::ffi::OsStr;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
 use windows::core::{PCWSTR, HSTRING};
@@ -19,7 +19,7 @@ fn main() {
     unsafe {
         let handle_result = CreateFileW(
             PCWSTR(pipe_name.as_ptr()),
-            0x40000000 | 0x80000000, // GENERIC_WRITE | GENERIC_READ
+            0xC0000000, // GENERIC_READ | GENERIC_WRITE
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
@@ -39,20 +39,30 @@ fn main() {
 
         let mut file = std::fs::File::from_raw_handle(handle.0 as *mut _);
         
+        // Authenticate
         if let Ok(token) = std::fs::read_to_string(r"C:\ProgramData\VoidCore\gui.token") {
             let _ = file.write_all(format!("TOKEN:{}\n", token.trim()).as_bytes());
         } else {
             let _ = file.write_all(b"\n");
         }
         
+        // Request Status
         let _ = file.write_all(b"status\n");
+        let _ = file.flush();
         
+        // Read exactly one line to avoid blocking on EOF across the privilege boundary
+        let mut reader = BufReader::new(file);
         let mut resp = String::new();
-        if file.read_to_string(&mut resp).is_ok() {
+        
+        if reader.read_line(&mut resp).is_ok() && !resp.trim().is_empty() {
             let title = HSTRING::from("VoidCore System Status");
-            let display_text = format!("Daemon responded:\n{}", resp.trim());
+            let display_text = format!("Daemon responded:\n\n{}", resp.trim());
             let body = HSTRING::from(display_text);
             let _ = MessageBoxW(None, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
+        } else {
+            let title = HSTRING::from("VoidCore Interface");
+            let body = HSTRING::from("Error: Connected to daemon, but received no response.");
+            let _ = MessageBoxW(None, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
         }
     }
 }
