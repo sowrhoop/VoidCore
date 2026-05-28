@@ -3,9 +3,10 @@ name = "installer-builder"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+bundled = []
+
 [dependencies]
-zip = "0.6"
-walkdir = "2.3"
 anyhow = "1.0"
 rand = "0.8"
 hex = "0.4"
