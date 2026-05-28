@@ -38,7 +38,6 @@ jobs:
           & $signtool sign /f cert.pfx /p $env:CERT_PASSWORD /tr http://timestamp.digicert.com /td sha256 /fd sha256 target/release/voidcore-service.exe target/release/voidcore-gui.exe
 
       - name: Generate Ed25519 Cryptographic Signatures
-        # This generates the .sig files the daemon's auto-updater relies on
         if: env.SIGNING_KEY != ''
         run: |
           pip install cryptography
@@ -71,10 +70,19 @@ jobs:
           $signtool = (Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object -Descending | Select-Object -First 1).FullName
           & $signtool sign /f cert.pfx /p $env:CERT_PASSWORD /tr http://timestamp.digicert.com /td sha256 /fd sha256 VoidCore-Setup.exe
 
+      - name: Determine Release Tag
+        # Automatically generate a tag for manual pipeline runs
+        run: |
+          if ('${{ github.ref_type }}' -eq 'tag') {
+              echo "RELEASE_TAG=${{ github.ref_name }}" >> $env:GITHUB_ENV
+          } else {
+              echo "RELEASE_TAG=v1.0.${{ github.run_number }}" >> $env:GITHUB_ENV
+          }
+
       - name: Publish GitHub Release
-        # This officially attaches all files to the Tagged Release so the API can find them
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           files: |
             VoidCore-Setup.exe
             target/release/voidcore-service.exe
