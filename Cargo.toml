@@ -1,15 +1,14 @@
-[workspace]
-members = [
-    "crates/service",
-    "crates/gui",
-    "crates/shared",
-    "tools/installer-builder",
-]
+[package]
+name = "installer-builder"
+version = "0.1.0"
+edition = "2021"
 
-# Workspace-level release defaults (individual crates may override)
-[profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true
+[features]
+bundled = []
+
+[dependencies]
+anyhow = "1.0"
+rand = "0.8"
+hex = "0.4"
+serde_json = "1.0"
+voidcore-shared = { path = "../../crates/shared" }

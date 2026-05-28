@@ -1,4 +1,4 @@
-name: VoidCore CI/CD & Cryptographic Release
+name: Build & Release VoidCore
 
 on:
   push:
@@ -7,97 +7,57 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-and-release:
-    name: Build, Sign, and Release
+  build-windows:
     runs-on: windows-latest
-    permissions:
-      contents: write
-      
-    env:
-      CERT_PFX: ${{ secrets.CERT_PFX }}
-      CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
-      SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
-
     steps:
-      - name: Checkout Source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Rust Toolchain
+      - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           target: x86_64-pc-windows-msvc
 
-      - name: Build Workspace
-        run: cargo build --workspace --release
+      - name: Build Core Binaries
+        # Compile everything except the installer first
+        run: cargo build --workspace --release --exclude installer-builder
 
-      - name: Run Installer Builder (Stage Files)
-        run: cargo run --bin installer-builder --release
-
-      - name: Authenticode Sign Binaries
-        if: env.CERT_PFX != '' && env.CERT_PASSWORD != ''
+      - name: Sign Core Binaries
+        if: "${{ secrets.CERT_PFX != '' }}"
+        env:
+          CERT_PFX: ${{ secrets.CERT_PFX }}
+          CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
         run: |
-          $pfxPath = "$env:TEMP\cert.pfx"
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:CERT_PFX))
-          
-          # signtool.exe is installed via Windows SDK but is NOT in the default system PATH.
-          # We dynamically search the SDK directory to find the x64 binary.
-          $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "signtool.exe" | Where-Object { $_.FullName -match "\\x64\\" } | Select-Object -First 1).FullName
-          
-          if (-not $signtool) {
-              Write-Error "Could not locate signtool.exe in the Windows SDK."
-              exit 1
-          }
-          Write-Host "Using signtool at: $signtool"
-          
-          # Sign Service and GUI Binaries using the dynamically resolved path
-          & $signtool sign /f $pfxPath /p $env:CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 target\release\voidcore-service.exe
-          & $signtool sign /f $pfxPath /p $env:CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 target\release\voidcore-gui.exe
-          
-          Remove-Item $pfxPath
+          [IO.File]::WriteAllBytes("cert.pfx", [Convert]::FromBase64String($env:CERT_PFX))
+          $signtool = (Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object -Descending | Select-Object -First 1).FullName
+          & $signtool sign /f cert.pfx /p $env:CERT_PASSWORD /tr http://timestamp.digicert.com /td sha256 /fd sha256 target/release/voidcore-service.exe target/release/voidcore-gui.exe
 
-      - name: Package Staged Release
-        run: Compress-Archive -Path dist\voidcore_staging\* -DestinationPath voidcore-release.zip
-
-      - name: Install Python Dependencies for Signing
-        if: env.SIGNING_KEY != ''
-        run: python -m pip install --upgrade pip cryptography
-
-      - name: Generate Ed25519 Cryptographic Signature
-        if: env.SIGNING_KEY != ''
+      - name: Stage Payloads for Installer
+        # Copy compiled artifacts into the installer's view before building it
         run: |
-          python -c "
-          import os, binascii
-          from cryptography.hazmat.primitives.asymmetric import ed25519
-          key_hex = os.environ.get('SIGNING_KEY', '')
-          if key_hex:
-              priv_key = ed25519.Ed25519PrivateKey.from_private_bytes(binascii.unhexlify(key_hex))
-              with open(r'target\release\voidcore-service.exe', 'rb') as f:
-                  data = f.read()
-              signature = priv_key.sign(data)
-              with open(r'target\release\voidcore-service.exe.sig', 'wb') as f:
-                  f.write(signature)
-          "
+          New-Item -ItemType Directory -Force -Path tools/installer-builder/payloads
+          Copy-Item target/release/voidcore-service.exe tools/installer-builder/payloads/
+          Copy-Item target/release/voidcore-gui.exe tools/installer-builder/payloads/
 
-      - name: Determine Release Tag
-        shell: bash
+      - name: Build Single EXE Installer
+        # VOIDCORE_PUBKEY is securely passed in and baked directly into the installer's rust code via option_env!()
+        env:
+          VOIDCORE_PUBKEY: ${{ secrets.PUBLIC_KEY }}
+        run: cargo build -p installer-builder --release --features bundled
+
+      - name: Rename Installer Artifact
+        run: Rename-Item target/release/installer-builder.exe VoidCore-Setup.exe
+
+      - name: Sign Installer
+        if: "${{ secrets.CERT_PFX != '' }}"
+        env:
+          CERT_PFX: ${{ secrets.CERT_PFX }}
+          CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
         run: |
-          # If this was triggered by a real git tag (e.g. v1.0.0), use it.
-          # Otherwise (manual run), generate a dynamic development tag.
-          if [ "${{ github.ref_type }}" == "tag" ]; then
-            echo "TAG_NAME=${{ github.ref_name }}" >> $GITHUB_ENV
-            echo "IS_PRERELEASE=false" >> $GITHUB_ENV
-          else
-            echo "TAG_NAME=dev-build-${{ github.run_number }}" >> $GITHUB_ENV
-            echo "IS_PRERELEASE=true" >> $GITHUB_ENV
-          fi
+          $signtool = (Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object -Descending | Select-Object -First 1).FullName
+          & $signtool sign /f cert.pfx /p $env:CERT_PASSWORD /tr http://timestamp.digicert.com /td sha256 /fd sha256 VoidCore-Setup.exe
 
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v1
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ env.TAG_NAME }}
-          prerelease: ${{ env.IS_PRERELEASE }}
-          name: Release ${{ env.TAG_NAME }}
-          files: |
-            voidcore-release.zip
-            target/release/voidcore-service.exe
-            target/release/voidcore-service.exe.sig
+          name: VoidCore-Setup
+          path: VoidCore-Setup.exe
