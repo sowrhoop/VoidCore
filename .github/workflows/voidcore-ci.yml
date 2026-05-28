@@ -44,11 +44,11 @@ jobs:
           Copy-Item target/release/voidcore-gui.exe tools/installer-builder/payloads/
 
       - name: Build Single EXE Installer
-        # VOIDCORE_PUBKEY is already mapped in the job-level env, so option_env!() in Rust will find it
         run: cargo build -p installer-builder --release --features bundled
 
-      - name: Rename Installer Artifact
-        run: Rename-Item target/release/installer-builder.exe VoidCore-Setup.exe
+      - name: Move and Rename Installer Artifact
+        # CHANGED: Use Move-Item to pull the file to the current root directory
+        run: Move-Item target/release/installer-builder.exe ./VoidCore-Setup.exe
 
       - name: Sign Installer
         if: env.CERT_PFX != ''
