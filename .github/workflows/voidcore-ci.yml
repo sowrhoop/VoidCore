@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # Required to publish GitHub Releases
+  contents: write
 
 jobs:
   build-windows:
@@ -21,6 +21,20 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Calculate Dynamic Version
+        # Extracts tag number if tagged, otherwise uses GitHub Run Number.
+        # This injects VOIDCORE_VERSION directly into the Rust build environment.
+        run: |
+          if ('${{ github.ref_type }}' -eq 'tag') {
+              $tag = "${{ github.ref_name }}"
+              $ver = $tag -replace 'v1\.0\.', ''
+              echo "RELEASE_TAG=$tag" >> $env:GITHUB_ENV
+              echo "VOIDCORE_VERSION=$ver" >> $env:GITHUB_ENV
+          } else {
+              echo "RELEASE_TAG=v1.0.${{ github.run_number }}" >> $env:GITHUB_ENV
+              echo "VOIDCORE_VERSION=${{ github.run_number }}" >> $env:GITHUB_ENV
+          }
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -69,15 +83,6 @@ jobs:
         run: |
           $signtool = (Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object -Descending | Select-Object -First 1).FullName
           & $signtool sign /f cert.pfx /p $env:CERT_PASSWORD /tr http://timestamp.digicert.com /td sha256 /fd sha256 VoidCore-Setup.exe
-
-      - name: Determine Release Tag
-        # Automatically generate a tag for manual pipeline runs
-        run: |
-          if ('${{ github.ref_type }}' -eq 'tag') {
-              echo "RELEASE_TAG=${{ github.ref_name }}" >> $env:GITHUB_ENV
-          } else {
-              echo "RELEASE_TAG=v1.0.${{ github.run_number }}" >> $env:GITHUB_ENV
-          }
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2

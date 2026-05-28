@@ -159,41 +159,69 @@ mod service_impl_enforce {
                         if let Ok(trace) = result {
                             let name_lower = trace.process_name.to_lowercase().trim_end_matches(".exe").to_string();
                             let whitelist: HashSet<String> = cfg_handle_wmi.lock().map(|c| c.whitelist.clone()).unwrap_or_default();
+                            
+                            let mut allow = false;
 
-                            let critical = ["system","smss","csrss","wininit","winlogon","lsass","services","svchost","explorer","voidcore-service", "voidcore-gui"];
+                            // 1. Hardcoded Critical Failsafes (In case path querying fails)
+                            let critical = ["system","smss","csrss","wininit","winlogon","lsass","services","svchost","voidcore-service", "voidcore-gui"];
                             if critical.contains(&name_lower.as_str()) {
                                 continue;
                             }
 
-                            let mut allow = whitelist.contains(&name_lower);
-                            
-                            if !allow {
-                                unsafe {
-                                    if let Ok(proc_handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, trace.process_id) {
-                                        let mut buffer = [0u16; 1024];
-                                        let len = K32GetProcessImageFileNameW(proc_handle, &mut buffer);
-                                        let _ = windows::Win32::Foundation::CloseHandle(proc_handle);
+                            // 2. Query the exact path of the launched process
+                            unsafe {
+                                if let Ok(proc_handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, trace.process_id) {
+                                    let mut buffer = [0u16; 1024];
+                                    let len = K32GetProcessImageFileNameW(proc_handle, &mut buffer);
+                                    let _ = windows::Win32::Foundation::CloseHandle(proc_handle);
+                                    
+                                    if len > 0 {
+                                        let path = String::from_utf16_lossy(&buffer[..len as usize]).to_lowercase();
                                         
-                                        if len > 0 {
-                                            let path = String::from_utf16_lossy(&buffer[..len as usize]).to_lowercase();
-                                            let trusted_paths = [
-                                                "\\appdata\\local\\programs\\",
-                                                "\\appdata\\roaming\\npm\\",
-                                                "\\appdata\\local\\npm\\",
-                                                "\\bravesoftware\\",
-                                                "\\vscodium\\",
-                                            ];
-                                            for tp in &trusted_paths {
-                                                if path.contains(tp) {
-                                                    allow = true;
-                                                    break;
-                                                }
+                                        // SMART ZONE 1: Protected Windows System UI and Infrastructure
+                                        // Standard Users cannot write here, making these paths cryptographically secure to trust.
+                                        if path.contains("\\windows\\system32\\") || 
+                                           path.contains("\\windows\\syswow64\\") || 
+                                           path.contains("\\windows\\systemapps\\") ||
+                                           path.contains("\\windows\\immersivecontrolpanel\\") ||
+                                           path.contains("\\windows\\explorer.exe") ||
+                                           path.contains("\\program files\\windowsapps\\") {
+                                            allow = true;
+                                        }
+
+                                        // SMART ZONE 2: Explicit Developer Path Trust
+                                        let trusted_paths = [
+                                            "\\appdata\\local\\programs\\",
+                                            "\\appdata\\roaming\\npm\\",
+                                            "\\appdata\\local\\npm\\",
+                                            "\\bravesoftware\\",
+                                            "\\vscodium\\",
+                                        ];
+                                        for tp in &trusted_paths {
+                                            if path.contains(tp) {
+                                                allow = true;
+                                                break;
                                             }
                                         }
                                     }
                                 }
                             }
 
+                            // 3. The Distraction Blocklist overrides path trust
+                            // Even if it installed to a trusted path, if it is a known game launcher, kill it.
+                            let junk = ["steam", "epicgameslauncher", "xboxapp", "gamebar", "riotclient"];
+                            for j in &junk {
+                                if name_lower.contains(j) {
+                                    allow = false;
+                                }
+                            }
+
+                            // 4. Fallback to strict name-based Whitelist
+                            if !allow && whitelist.contains(&name_lower) {
+                                allow = true;
+                            }
+                            
+                            // 5. Execution
                             if !allow {
                                 unsafe {
                                     if let Ok(handle) = OpenProcess(PROCESS_TERMINATE, false, trace.process_id) {
@@ -511,20 +539,17 @@ mod service_impl_updater {
         let remote_v: u32 = release.tag_name.trim_start_matches("v1.0.").parse().unwrap_or(0);
 
         if remote_v <= cfg.version_code {
-            return Ok(false); // No update required
+            return Ok(false);
         }
 
         let pub_bytes = hex::decode(&cfg.pubkey_hex)?;
         let pub_array: [u8; 32] = pub_bytes.as_slice().try_into().map_err(|_| "Public key must be 32 bytes")?;
         let public_key = VerifyingKey::from_bytes(&pub_array)?;
 
-        // Update BOTH the service and GUI binaries if they exist in the release
         let binaries_to_update = ["voidcore-service.exe", "voidcore-gui.exe"];
-        
         let mut updated_at_least_one = false;
 
         for binary_name in binaries_to_update {
-            // Find assets, skip if this specific binary isn't in the release
             let exe_asset = match release.assets.iter().find(|a| a.name == binary_name) {
                 Some(asset) => asset,
                 None => continue,
@@ -546,7 +571,6 @@ mod service_impl_updater {
             let sig_array: [u8; 64] = sig_bytes[..64].try_into().map_err(|_| "Signature must be 64 bytes")?;
             let signature = Signature::from_bytes(&sig_array);
 
-            // Halt immediately if ANY cryptographic verification fails
             public_key.verify(&exe_bytes, &signature)
                 .map_err(|_| format!("Signature verification FAILED for {}", binary_name))?;
 
@@ -556,15 +580,12 @@ mod service_impl_updater {
 
             fs::write(&staging, &exe_bytes)?;
             let _ = fs::remove_file(&old);
-            
-            // Note: Windows allows renaming an actively running executable file
             if target.exists() { fs::rename(&target, &old)?; }
             
             if let Err(e) = fs::rename(&staging, &target) {
                 if old.exists() { let _ = fs::rename(&old, &target); }
                 return Err(e.into());
             }
-            
             updated_at_least_one = true;
         }
 
