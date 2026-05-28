@@ -6,15 +6,18 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write # Required to publish GitHub Releases
+
 jobs:
   build-windows:
     runs-on: windows-latest
     
-    # Map secrets to job-level environment variables so they can be safely evaluated in 'if' conditions
     env:
       CERT_PFX: ${{ secrets.CERT_PFX }}
       CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
       VOIDCORE_PUBKEY: ${{ secrets.PUBLIC_KEY }}
+      SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
 
     steps:
       - uses: actions/checkout@v4
@@ -25,19 +28,32 @@ jobs:
           target: x86_64-pc-windows-msvc
 
       - name: Build Core Binaries
-        # Compile everything except the installer first
         run: cargo build --workspace --release --exclude installer-builder
 
-      - name: Sign Core Binaries
-        # Now we evaluate against the 'env' context instead of the 'secrets' context
+      - name: Sign Core Binaries (Authenticode)
         if: env.CERT_PFX != ''
         run: |
           [IO.File]::WriteAllBytes("cert.pfx", [Convert]::FromBase64String($env:CERT_PFX))
           $signtool = (Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object -Descending | Select-Object -First 1).FullName
           & $signtool sign /f cert.pfx /p $env:CERT_PASSWORD /tr http://timestamp.digicert.com /td sha256 /fd sha256 target/release/voidcore-service.exe target/release/voidcore-gui.exe
 
+      - name: Generate Ed25519 Cryptographic Signatures
+        # This generates the .sig files the daemon's auto-updater relies on
+        if: env.SIGNING_KEY != ''
+        run: |
+          pip install cryptography
+          python -c "
+          import os, binascii
+          from cryptography.hazmat.primitives.asymmetric import ed25519
+          
+          priv_key = ed25519.Ed25519PrivateKey.from_private_bytes(binascii.unhexlify(os.environ['SIGNING_KEY']))
+          for exe in ['target/release/voidcore-service.exe', 'target/release/voidcore-gui.exe']:
+              with open(exe, 'rb') as f: data = f.read()
+              sig = priv_key.sign(data)
+              with open(exe + '.sig', 'wb') as f: f.write(sig)
+          "
+
       - name: Stage Payloads for Installer
-        # Copy compiled artifacts into the installer's view before building it
         run: |
           New-Item -ItemType Directory -Force -Path tools/installer-builder/payloads
           Copy-Item target/release/voidcore-service.exe tools/installer-builder/payloads/
@@ -47,17 +63,21 @@ jobs:
         run: cargo build -p installer-builder --release --features bundled
 
       - name: Move and Rename Installer Artifact
-        # CHANGED: Use Move-Item to pull the file to the current root directory
         run: Move-Item target/release/installer-builder.exe ./VoidCore-Setup.exe
 
-      - name: Sign Installer
+      - name: Sign Installer (Authenticode)
         if: env.CERT_PFX != ''
         run: |
           $signtool = (Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object -Descending | Select-Object -First 1).FullName
           & $signtool sign /f cert.pfx /p $env:CERT_PASSWORD /tr http://timestamp.digicert.com /td sha256 /fd sha256 VoidCore-Setup.exe
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+      - name: Publish GitHub Release
+        # This officially attaches all files to the Tagged Release so the API can find them
+        uses: softprops/action-gh-release@v2
         with:
-          name: VoidCore-Setup
-          path: VoidCore-Setup.exe
+          files: |
+            VoidCore-Setup.exe
+            target/release/voidcore-service.exe
+            target/release/voidcore-service.exe.sig
+            target/release/voidcore-gui.exe
+            target/release/voidcore-gui.exe.sig

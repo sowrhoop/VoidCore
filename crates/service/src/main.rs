@@ -15,9 +15,7 @@ const SERVICE_NAME: &str = "VoidCoreDaemon";
 define_windows_service!(ffi_service_main, my_service_main);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Attempt to start via Windows Service Control Manager
     if let Err(_) = service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
-        // Fallback: Run directly (useful for local debugging)
         let _ = logging::log_event("core", "WARN", "Running outside of SCM");
         run_service()?;
     }
@@ -49,7 +47,6 @@ fn run_service_scm() -> Result<(), windows_service::Error> {
         process_id: None,
     })?;
 
-    // Block here holding the main service lifecycle
     let _ = run_service();
 
     status_handle.set_service_status(ServiceStatus {
@@ -89,7 +86,6 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     service_impl_updater::start_auto_updater(cfg_handle.clone());
     service_impl_enforce::start_enforcement(cfg_handle.clone());
 
-    // Keep service alive
     loop {
         std::thread::sleep(Duration::from_secs(60));
     }
@@ -105,8 +101,6 @@ mod logging {
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    /// Simple structured logger for the service. Writes to
-    /// C:\ProgramData\VoidCore\logs\<component>.log
     pub fn log_event(component: &str, level: &str, message: &str) -> std::io::Result<()> {
         let base = Path::new(r"C:\ProgramData\VoidCore");
         let logs = base.join("logs");
@@ -210,7 +204,7 @@ mod service_impl_enforce {
                             }
                         }
                     }
-                }; // Semicolon here explicitly releases the WMI iterator borrow before context destruction
+                };
             })
             .ok();
 
@@ -239,7 +233,6 @@ mod service_impl_enforce {
         let user_w = to_wide("VoidCoreAdmin");
         let mut pass_w = to_wide(&pass);
         
-        // Correct mapping of PWSTR taking the mutable raw pointer to the U16 buffer string
         let mut info = USER_INFO_1003 { usri1003_password: PWSTR(pass_w.as_mut_ptr()) };
         unsafe {
             let _ = NetUserSetInfo(PCWSTR::null(), PCWSTR(user_w.as_ptr()), 1003, &mut info as *mut _ as *mut u8, None);
@@ -358,13 +351,11 @@ mod service_impl_ipc {
                 wide.push(0);
 
                 loop {
-                    // Correctly returns a HANDLE directly in windows 0.52
                     let handle = CreateNamedPipeW(
                         PCWSTR(wide.as_ptr()),
-                        FILE_FLAGS_AND_ATTRIBUTES(3), // 3 = PIPE_ACCESS_DUPLEX
+                        FILE_FLAGS_AND_ATTRIBUTES(3),
                         PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-                        255, // 255 = PIPE_UNLIMITED_INSTANCES
-                        4096, 4096, 0, None,
+                        255, 4096, 4096, 0, None,
                     );
 
                     if handle.0 == INVALID_HANDLE_VALUE.0 || handle.0 == 0 {
@@ -401,7 +392,6 @@ mod service_impl_ipc {
                                 if GetNamedPipeClientProcessId(handle, &mut client_pid).is_ok() && client_pid != 0 {
                                     if let Ok(proc_handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, client_pid) {
                                         let mut token = HANDLE(0);
-                                        // Wrapped the 8u32 in the required TOKEN_ACCESS_MASK type wrapper!
                                         if OpenProcessToken(proc_handle, TOKEN_ACCESS_MASK(8u32), &mut token).is_ok() {
                                             let mut size: u32 = 0;
                                             let _ = GetTokenInformation(token, TokenUser, None, 0, &mut size);
@@ -418,7 +408,6 @@ mod service_impl_ipc {
                                                         
                                                         if sid.trim() != expected_sid { authorized = false; }
                                                         
-                                                        // Properly free memory to prevent security token leaks
                                                         let _ = LocalFree(HLOCAL(sid_str_ptr.0 as *mut _));
                                                     }
                                                 }
@@ -522,51 +511,69 @@ mod service_impl_updater {
         let remote_v: u32 = release.tag_name.trim_start_matches("v1.0.").parse().unwrap_or(0);
 
         if remote_v <= cfg.version_code {
-            return Ok(false);
+            return Ok(false); // No update required
         }
-
-        let exe_asset = release.assets.iter()
-            .find(|a| a.name == "voidcore-service.exe")
-            .ok_or("Release has no service exe asset")?;
-
-        let sig_asset = release.assets.iter()
-            .find(|a| a.name == format!("{}.sig", exe_asset.name))
-            .ok_or("Release has no signature asset")?;
-
-        let mut exe_bytes = Vec::new();
-        ureq::get(&exe_asset.browser_download_url).call()?.into_reader().read_to_end(&mut exe_bytes)?;
-
-        let mut sig_bytes = Vec::new();
-        ureq::get(&sig_asset.browser_download_url).call()?.into_reader().read_to_end(&mut sig_bytes)?;
-
-        if sig_bytes.len() < 64 { return Err("Signature file too short".into()); }
 
         let pub_bytes = hex::decode(&cfg.pubkey_hex)?;
         let pub_array: [u8; 32] = pub_bytes.as_slice().try_into().map_err(|_| "Public key must be 32 bytes")?;
         let public_key = VerifyingKey::from_bytes(&pub_array)?;
 
-        let sig_array: [u8; 64] = sig_bytes[..64].try_into().map_err(|_| "Signature must be 64 bytes")?;
+        // Update BOTH the service and GUI binaries if they exist in the release
+        let binaries_to_update = ["voidcore-service.exe", "voidcore-gui.exe"];
         
-        // Corrected to directly bind without `?`
-        let signature = Signature::from_bytes(&sig_array);
+        let mut updated_at_least_one = false;
 
-        public_key.verify(&exe_bytes, &signature).map_err(|_| "Signature verification FAILED")?;
+        for binary_name in binaries_to_update {
+            // Find assets, skip if this specific binary isn't in the release
+            let exe_asset = match release.assets.iter().find(|a| a.name == binary_name) {
+                Some(asset) => asset,
+                None => continue,
+            };
 
-        let target = Path::new(INSTALL_DIR).join(&exe_asset.name);
-        let old = Path::new(INSTALL_DIR).join(format!("{}.old", &exe_asset.name));
-        let staging = Path::new(INSTALL_DIR).join(format!("{}.new", &exe_asset.name));
+            let sig_asset = match release.assets.iter().find(|a| a.name == format!("{}.sig", binary_name)) {
+                Some(asset) => asset,
+                None => continue,
+            };
 
-        fs::write(&staging, &exe_bytes)?;
-        let _ = fs::remove_file(&old);
-        if target.exists() { fs::rename(&target, &old)?; }
-        
-        if let Err(e) = fs::rename(&staging, &target) {
-            if old.exists() { let _ = fs::rename(&old, &target); }
-            return Err(e.into());
+            let mut exe_bytes = Vec::new();
+            ureq::get(&exe_asset.browser_download_url).call()?.into_reader().read_to_end(&mut exe_bytes)?;
+
+            let mut sig_bytes = Vec::new();
+            ureq::get(&sig_asset.browser_download_url).call()?.into_reader().read_to_end(&mut sig_bytes)?;
+
+            if sig_bytes.len() < 64 { return Err(format!("Signature file for {} too short", binary_name).into()); }
+
+            let sig_array: [u8; 64] = sig_bytes[..64].try_into().map_err(|_| "Signature must be 64 bytes")?;
+            let signature = Signature::from_bytes(&sig_array);
+
+            // Halt immediately if ANY cryptographic verification fails
+            public_key.verify(&exe_bytes, &signature)
+                .map_err(|_| format!("Signature verification FAILED for {}", binary_name))?;
+
+            let target = Path::new(INSTALL_DIR).join(binary_name);
+            let old = Path::new(INSTALL_DIR).join(format!("{}.old", binary_name));
+            let staging = Path::new(INSTALL_DIR).join(format!("{}.new", binary_name));
+
+            fs::write(&staging, &exe_bytes)?;
+            let _ = fs::remove_file(&old);
+            
+            // Note: Windows allows renaming an actively running executable file
+            if target.exists() { fs::rename(&target, &old)?; }
+            
+            if let Err(e) = fs::rename(&staging, &target) {
+                if old.exists() { let _ = fs::rename(&old, &target); }
+                return Err(e.into());
+            }
+            
+            updated_at_least_one = true;
         }
 
-        write_registry_version(cfg.version_code);
-        Ok(true)
+        if updated_at_least_one {
+            write_registry_version(remote_v);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     fn write_registry_version(version: u32) {
