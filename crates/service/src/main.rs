@@ -162,13 +162,11 @@ mod service_impl_enforce {
                             
                             let mut allow = false;
 
-                            // 1. Hardcoded Critical Failsafes (In case path querying fails)
                             let critical = ["system","smss","csrss","wininit","winlogon","lsass","services","svchost","voidcore-service", "voidcore-gui"];
                             if critical.contains(&name_lower.as_str()) {
                                 continue;
                             }
 
-                            // 2. Query the exact path of the launched process
                             unsafe {
                                 if let Ok(proc_handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, trace.process_id) {
                                     let mut buffer = [0u16; 1024];
@@ -178,8 +176,6 @@ mod service_impl_enforce {
                                     if len > 0 {
                                         let path = String::from_utf16_lossy(&buffer[..len as usize]).to_lowercase();
                                         
-                                        // SMART ZONE 1: Protected Windows System UI and Infrastructure
-                                        // Standard Users cannot write here, making these paths cryptographically secure to trust.
                                         if path.contains("\\windows\\system32\\") || 
                                            path.contains("\\windows\\syswow64\\") || 
                                            path.contains("\\windows\\systemapps\\") ||
@@ -189,7 +185,6 @@ mod service_impl_enforce {
                                             allow = true;
                                         }
 
-                                        // SMART ZONE 2: Explicit Developer Path Trust
                                         let trusted_paths = [
                                             "\\appdata\\local\\programs\\",
                                             "\\appdata\\roaming\\npm\\",
@@ -207,8 +202,6 @@ mod service_impl_enforce {
                                 }
                             }
 
-                            // 3. The Distraction Blocklist overrides path trust
-                            // Even if it installed to a trusted path, if it is a known game launcher, kill it.
                             let junk = ["steam", "epicgameslauncher", "xboxapp", "gamebar", "riotclient"];
                             for j in &junk {
                                 if name_lower.contains(j) {
@@ -216,12 +209,10 @@ mod service_impl_enforce {
                                 }
                             }
 
-                            // 4. Fallback to strict name-based Whitelist
                             if !allow && whitelist.contains(&name_lower) {
                                 allow = true;
                             }
                             
-                            // 5. Execution
                             if !allow {
                                 unsafe {
                                     if let Ok(handle) = OpenProcess(PROCESS_TERMINATE, false, trace.process_id) {
@@ -370,21 +361,51 @@ mod service_impl_ipc {
                 use windows::Win32::System::Pipes::{CreateNamedPipeW, ConnectNamedPipe, DisconnectNamedPipe, PIPE_TYPE_MESSAGE, PIPE_READMODE_MESSAGE, PIPE_WAIT, GetNamedPipeClientProcessId};
                 use windows::Win32::Foundation::{HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree};
                 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, OpenProcessToken};
-                use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_USER, TOKEN_ACCESS_MASK};
-                use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+                use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_USER, TOKEN_ACCESS_MASK, SECURITY_ATTRIBUTES, PSECURITY_DESCRIPTOR};
+                use windows::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW};
                 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+
+                const SDDL_REVISION_1: u32 = 1;
 
                 let pipe_name = r"\\.\pipe\voidcore_ipc";
                 let mut wide: Vec<u16> = OsStr::new(pipe_name).encode_wide().collect();
                 wide.push(0);
 
+                // SDDL: Discretionary ACL (D:) granting Generic All (GA) to Everyone (WD)
+                let sddl_str = r"D:(A;;GA;;;WD)";
+                let mut sddl_wide: Vec<u16> = OsStr::new(sddl_str).encode_wide().collect();
+                sddl_wide.push(0);
+
                 loop {
+                    let mut sd = PSECURITY_DESCRIPTOR::default();
+                    let mut sa = SECURITY_ATTRIBUTES {
+                        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                        lpSecurityDescriptor: std::ptr::null_mut(),
+                        bInheritHandle: windows::Win32::Foundation::BOOL(0),
+                    };
+
+                    // Convert the SDDL string to a raw Security Descriptor
+                    if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        PCWSTR(sddl_wide.as_ptr()),
+                        SDDL_REVISION_1,
+                        &mut sd,
+                        None
+                    ).is_ok() {
+                        sa.lpSecurityDescriptor = sd.0;
+                    }
+
+                    // Pass the Security Attributes to allow cross-privilege communication
                     let handle = CreateNamedPipeW(
                         PCWSTR(wide.as_ptr()),
                         FILE_FLAGS_AND_ATTRIBUTES(3),
                         PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-                        255, 4096, 4096, 0, None,
+                        255, 4096, 4096, 0,
+                        Some(&sa),
                     );
+
+                    if !sd.0.is_null() {
+                        let _ = LocalFree(HLOCAL(sd.0));
+                    }
 
                     if handle.0 == INVALID_HANDLE_VALUE.0 || handle.0 == 0 {
                         std::thread::sleep(std::time::Duration::from_secs(5));
