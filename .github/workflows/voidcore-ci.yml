@@ -9,6 +9,13 @@ on:
 jobs:
   build-windows:
     runs-on: windows-latest
+    
+    # Map secrets to job-level environment variables so they can be safely evaluated in 'if' conditions
+    env:
+      CERT_PFX: ${{ secrets.CERT_PFX }}
+      CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
+      VOIDCORE_PUBKEY: ${{ secrets.PUBLIC_KEY }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -22,10 +29,8 @@ jobs:
         run: cargo build --workspace --release --exclude installer-builder
 
       - name: Sign Core Binaries
-        if: "${{ secrets.CERT_PFX != '' }}"
-        env:
-          CERT_PFX: ${{ secrets.CERT_PFX }}
-          CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
+        # Now we evaluate against the 'env' context instead of the 'secrets' context
+        if: env.CERT_PFX != ''
         run: |
           [IO.File]::WriteAllBytes("cert.pfx", [Convert]::FromBase64String($env:CERT_PFX))
           $signtool = (Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object -Descending | Select-Object -First 1).FullName
@@ -39,19 +44,14 @@ jobs:
           Copy-Item target/release/voidcore-gui.exe tools/installer-builder/payloads/
 
       - name: Build Single EXE Installer
-        # VOIDCORE_PUBKEY is securely passed in and baked directly into the installer's rust code via option_env!()
-        env:
-          VOIDCORE_PUBKEY: ${{ secrets.PUBLIC_KEY }}
+        # VOIDCORE_PUBKEY is already mapped in the job-level env, so option_env!() in Rust will find it
         run: cargo build -p installer-builder --release --features bundled
 
       - name: Rename Installer Artifact
         run: Rename-Item target/release/installer-builder.exe VoidCore-Setup.exe
 
       - name: Sign Installer
-        if: "${{ secrets.CERT_PFX != '' }}"
-        env:
-          CERT_PFX: ${{ secrets.CERT_PFX }}
-          CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
+        if: env.CERT_PFX != ''
         run: |
           $signtool = (Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object -Descending | Select-Object -First 1).FullName
           & $signtool sign /f cert.pfx /p $env:CERT_PASSWORD /tr http://timestamp.digicert.com /td sha256 /fd sha256 VoidCore-Setup.exe
