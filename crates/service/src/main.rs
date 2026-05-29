@@ -334,14 +334,23 @@ mod service_impl_enforce {
 
     fn enforce_global_mullvad_dns() {
         let ps = r#"
-            Get-NetIPInterface | Where-Object { $_.ConnectionState -eq 'Connected' } | ForEach-Object {
-                Set-DnsClientServerAddress `
-                    -InterfaceIndex $_.InterfaceIndex `
-                    -ServerAddresses ('194.242.2.9','2a07:e340::9') `
-                    -ErrorAction SilentlyContinue
+            # 1. Register Mullvad DoH in Windows 11 to bypass ISP Port 53 blocking
+            Add-DnsClientDohServerAddress -ServerAddress '194.242.2.9' -DohTemplate 'https://all.dns.mullvad.net/dns-query' -AllowFallbackToUdp $True -AutoUpgrade $True -ErrorAction SilentlyContinue
+            Add-DnsClientDohServerAddress -ServerAddress '2a07:e340::9' -DohTemplate 'https://all.dns.mullvad.net/dns-query' -AllowFallbackToUdp $True -AutoUpgrade $True -ErrorAction SilentlyContinue
+
+            # 2. Apply DNS strictly by Address Family to prevent adapter crashes on IPv4-only networks
+            $adapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' }
+            foreach ($a in $adapters) {
+                Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses '194.242.2.9' -Family IPv4 -ErrorAction SilentlyContinue
+                Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses '2a07:e340::9' -Family IPv6 -ErrorAction SilentlyContinue
             }
+            
+            # 3. Flush stale cache to force immediate connection
+            Clear-DnsClientCache -ErrorAction SilentlyContinue
         "#;
-        let _ = std::process::Command::new("powershell").args(["-NoProfile","-NonInteractive","-WindowStyle","Hidden","-Command", ps]).output();
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps])
+            .output();
     }
 
     fn rotate_local_admin_password() {
