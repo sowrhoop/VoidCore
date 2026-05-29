@@ -76,12 +76,11 @@ impl VoidCoreApp {
                 let parts: Vec<&str> = line.splitn(3, ' ').collect();
                 if parts.len() == 3 {
                     if let Ok(timestamp) = parts[0].parse::<i64>() {
-                        if let match_opt = Local.timestamp_opt(timestamp, 0) {
-                            if let chrono::LocalResult::Single(dt) = match_opt {
-                                let formatted = format!("{}  {}  {}", dt.format("%Y-%m-%d %H:%M:%S"), parts[1], parts[2]);
-                                self.logs.push(formatted);
-                                continue;
-                            }
+                        // Fixed the warning: Directly pattern match the result
+                        if let chrono::LocalResult::Single(dt) = Local.timestamp_opt(timestamp, 0) {
+                            let formatted = format!("{}  {}  {}", dt.format("%Y-%m-%d %H:%M:%S"), parts[1], parts[2]);
+                            self.logs.push(formatted);
+                            continue;
                         }
                     }
                 }
