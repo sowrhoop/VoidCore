@@ -5,13 +5,7 @@ edition = "2021"
 
 [dependencies]
 voidcore-shared = { path = "../shared" }
-
-[dependencies.windows]
-version = "0.52"
-features = [
-    "Win32_Foundation", 
-    "Win32_UI_WindowsAndMessaging", 
-    "Win32_System_Threading",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Pipes"
-]
+eframe = "0.27"
+chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

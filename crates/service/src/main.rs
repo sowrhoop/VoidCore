@@ -114,11 +114,11 @@ mod logging {
 }
 
 mod service_impl_enforce {
-    use std::collections::HashSet;
+    use std::collections::{HashSet, HashMap};
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use std::net::ToSocketAddrs;
     use voidcore_shared::RuntimeConfig;
     use wmi::{COMLibrary, WMIConnection};
@@ -138,6 +138,31 @@ mod service_impl_enforce {
 
     fn to_wide(s: &str) -> Vec<u16> {
         OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// Crosses the Session 0 boundary to instantly pop a native notification on the active user's screen
+    fn notify_user(title_str: &str, msg_str: &str) {
+        unsafe {
+            use windows::Win32::System::RemoteDesktop::{WTSSendMessageW, WTS_ACTIVE_SESSION_ID};
+            use windows::Win32::Foundation::HANDLE;
+            
+            let title = to_wide(title_str);
+            let msg = to_wide(msg_str);
+            let mut response: u32 = 0;
+            
+            let _ = WTSSendMessageW(
+                HANDLE(0), // WTS_CURRENT_SERVER_HANDLE
+                WTS_ACTIVE_SESSION_ID,
+                PCWSTR(title.as_ptr()),
+                (title.len() * 2) as u32,
+                PCWSTR(msg.as_ptr()),
+                (msg.len() * 2) as u32,
+                0x00000030, // MB_ICONEXCLAMATION
+                5, // Timeout
+                &mut response,
+                windows::Win32::Foundation::BOOL(0), // Don't wait for user response
+            );
+        }
     }
 
     fn get_authenticode_publisher(path: &str) -> Option<String> {
@@ -172,7 +197,9 @@ mod service_impl_enforce {
                     }
                 };
                 
+                let mut last_notified: HashMap<String, Instant> = HashMap::new();
                 let wmi_con = WMIConnection::new(com).unwrap();
+                
                 if let Ok(iterator) = wmi_con.notification::<Win32_ProcessStartTrace>() {
                     for result in iterator {
                         if let Ok(trace) = result {
@@ -182,7 +209,7 @@ mod service_impl_enforce {
                             let mut allow = false;
                             let mut is_ephemeral_installer = false;
 
-                            let critical = ["system","smss","csrss","wininit","winlogon","lsass","services","svchost","voidcore-service", "voidcore-gui"];
+                            let critical = ["system","smss","csrss","wininit","winlogon","lsass","services","svchost","voidcore-service", "voidcore-gui", "voidcore-setup"];
                             if critical.contains(&name_lower.as_str()) { continue; }
 
                             unsafe {
@@ -255,7 +282,24 @@ mod service_impl_enforce {
 
                                     if !allow {
                                         let _ = TerminateProcess(proc_handle, 1);
+                                        crate::logging::log_event("enforce", "BLOCK", &format!("Terminated unauthorised process: {}", name_lower));
+                                        
+                                        // Rate limit popups to 1 per minute per app
+                                        let now = Instant::now();
+                                        if last_notified.get(&name_lower).map(|t| now.duration_since(*t).as_secs() > 60).unwrap_or(true) {
+                                            notify_user("VoidCore Enforcer", &format!("Process Terminated:\n{}\n\nNot on whitelist or trusted publisher list.", trace.process_name));
+                                            last_notified.insert(name_lower.clone(), now);
+                                        }
+                                        
                                     } else if is_ephemeral_installer {
+                                        crate::logging::log_event("enforce", "ALLOW", &format!("Allowed installer with 15m timebomb: {}", name_lower));
+                                        
+                                        let now = Instant::now();
+                                        if last_notified.get(&name_lower).map(|t| now.duration_since(*t).as_secs() > 60).unwrap_or(true) {
+                                            notify_user("VoidCore Enforcer", &format!("Allowed Installer:\n{}\n\nA 15-minute execution limit has been applied.", trace.process_name));
+                                            last_notified.insert(name_lower.clone(), now);
+                                        }
+
                                         let pid = trace.process_id;
                                         thread::Builder::new()
                                             .name(format!("timebomb-{}", pid))
@@ -265,6 +309,7 @@ mod service_impl_enforce {
                                                     if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
                                                         let _ = TerminateProcess(bomb_handle, 1);
                                                         let _ = windows::Win32::Foundation::CloseHandle(bomb_handle);
+                                                        crate::logging::log_event("enforce", "BLOCK", "Timebomb detonated installer.");
                                                     }
                                                 }
                                             }).ok();
@@ -334,23 +379,17 @@ mod service_impl_enforce {
 
     fn enforce_global_mullvad_dns() {
         let ps = r#"
-            # 1. Register Mullvad DoH in Windows 11 to bypass ISP Port 53 blocking
             Add-DnsClientDohServerAddress -ServerAddress '194.242.2.9' -DohTemplate 'https://all.dns.mullvad.net/dns-query' -AllowFallbackToUdp $True -AutoUpgrade $True -ErrorAction SilentlyContinue
             Add-DnsClientDohServerAddress -ServerAddress '2a07:e340::9' -DohTemplate 'https://all.dns.mullvad.net/dns-query' -AllowFallbackToUdp $True -AutoUpgrade $True -ErrorAction SilentlyContinue
 
-            # 2. Apply DNS strictly by Address Family to prevent adapter crashes on IPv4-only networks
             $adapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' }
             foreach ($a in $adapters) {
                 Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses '194.242.2.9' -Family IPv4 -ErrorAction SilentlyContinue
                 Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses '2a07:e340::9' -Family IPv6 -ErrorAction SilentlyContinue
             }
-            
-            # 3. Flush stale cache to force immediate connection
             Clear-DnsClientCache -ErrorAction SilentlyContinue
         "#;
-        let _ = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps])
-            .output();
+        let _ = std::process::Command::new("powershell").args(["-NoProfile","-NonInteractive","-WindowStyle","Hidden","-Command", ps]).output();
     }
 
     fn rotate_local_admin_password() {
@@ -426,12 +465,10 @@ mod service_impl_enforce {
                 let mut hkey = Default::default();
                 
                 if RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(base_w.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey, None).is_ok() {
-                    // 1. Incognito Locked Down
                     let incognito_val: u32 = 2; // 2 = disabled
                     let inc_name = to_wide("IncognitoModeAvailability");
                     let _ = RegSetValueExW(hkey, PCWSTR(inc_name.as_ptr()), 0, REG_DWORD, Some(std::slice::from_raw_parts(&incognito_val as *const _ as *const u8, 4)));
 
-                    // 2. DoH Locked to Mullvad
                     let mode_val = to_wide("secure");
                     let mode_name = to_wide("DnsOverHttpsMode");
                     let _ = RegSetValueExW(hkey, PCWSTR(mode_name.as_ptr()), 0, REG_SZ, Some(std::slice::from_raw_parts(mode_val.as_ptr() as *const u8, mode_val.len() * 2)));
@@ -441,7 +478,6 @@ mod service_impl_enforce {
                     let _ = RegSetValueExW(hkey, PCWSTR(tpl_name.as_ptr()), 0, REG_SZ, Some(std::slice::from_raw_parts(tpl_val.as_ptr() as *const u8, tpl_val.len() * 2)));
                 }
 
-                // 3. Blocklist Domains
                 let bl_w = to_wide(*bl_path);
                 let _ = RegDeleteTreeW(HKEY_LOCAL_MACHINE, PCWSTR(bl_w.as_ptr()));
                 let mut hkey_block = Default::default();
@@ -454,25 +490,22 @@ mod service_impl_enforce {
                     }
                 }
 
-                // 4. Block ALL Extensions
                 let ext_blk_w = to_wide(*ext_block_path);
                 let _ = RegDeleteTreeW(HKEY_LOCAL_MACHINE, PCWSTR(ext_blk_w.as_ptr()));
                 let mut hkey_ext_block = Default::default();
                 if RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(ext_blk_w.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey_ext_block, None).is_ok() {
                     let val_num_w = to_wide("1");
-                    let pattern_w = to_wide("*"); // Asterisk means BLOCK ALL
+                    let pattern_w = to_wide("*");
                     let pattern_bytes = std::slice::from_raw_parts(pattern_w.as_ptr() as *const u8, pattern_w.len() * 2);
                     let _ = RegSetValueExW(hkey_ext_block, PCWSTR(val_num_w.as_ptr()), 0, REG_SZ, Some(pattern_bytes));
                 }
 
-                // 5. Explicitly ALLOW Bitwarden
                 let ext_alw_w = to_wide(*ext_allow_path);
                 let _ = RegDeleteTreeW(HKEY_LOCAL_MACHINE, PCWSTR(ext_alw_w.as_ptr()));
                 let mut hkey_ext_allow = Default::default();
                 if RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(ext_alw_w.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey_ext_allow, None).is_ok() {
                     let val_num_w = to_wide("1");
-                    // Bitwarden Extension ID (Same across Chrome/Edge/Brave)
-                    let pattern_w = to_wide("nngceckbapebfimnlniiiahkandclblb");
+                    let pattern_w = to_wide("nngceckbapebfimnlniiiahkandclblb"); // Bitwarden
                     let pattern_bytes = std::slice::from_raw_parts(pattern_w.as_ptr() as *const u8, pattern_w.len() * 2);
                     let _ = RegSetValueExW(hkey_ext_allow, PCWSTR(val_num_w.as_ptr()), 0, REG_SZ, Some(pattern_bytes));
                 }
