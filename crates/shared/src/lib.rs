@@ -12,11 +12,8 @@ pub fn binary_version() -> u32 {
 pub struct RuntimeConfig {
     pub whitelist: HashSet<String>,
     pub url_blocklist: HashSet<String>,
-    
-    // NEW: Cryptographically trusted software publishers
     #[serde(default)]
     pub trusted_publishers: HashSet<String>,
-    
     pub github_repo: String,
     pub pubkey_hex: String,
     
@@ -26,20 +23,22 @@ pub struct RuntimeConfig {
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
+        // We use option_env! to read GitHub Secrets during the CI/CD build.
+        // If they are missing (e.g., local development), it falls back to defaults.
+        let whitelist_raw = option_env!("APP_WHITELIST").unwrap_or("code,docker,python,wt,msedge,cursor,brave,vscodium");
+        let blocklist_raw = option_env!("URL_BLOCKLIST").unwrap_or("reddit.com,twitter.com,x.com,instagram.com,facebook.com,tiktok.com,youtube.com,twitch.tv,netflix.com,9gag.com,discord.com");
+        let publishers_raw = option_env!("TRUSTED_PUBLISHERS").unwrap_or("Brave Software, Inc.,Microsoft Corporation,GitHub, Inc.,Discord Inc.");
+        
         Self {
-            whitelist: ["code","docker","python","wt","msedge","cursor","brave","vscodium"].iter().map(|s| s.to_string()).collect(),
-            url_blocklist: ["reddit.com","twitter.com","x.com","instagram.com","facebook.com","tiktok.com","youtube.com","twitch.tv","netflix.com","9gag.com","discord.com"].iter().map(|s| s.to_string()).collect(),
+            whitelist: whitelist_raw.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect(),
+            url_blocklist: blocklist_raw.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect(),
+            trusted_publishers: publishers_raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
             
-            // Map the exact strings found in the Authenticode Subject certificates
-            trusted_publishers: [
-                "Brave Software, Inc.",
-                "Microsoft Corporation",
-                "GitHub, Inc.",
-                "Discord Inc."
-            ].iter().map(|s| s.to_string()).collect(),
+            github_repo: "sowrhoop/VoidCore".to_string(), // You can also put this in a secret if desired
             
-            github_repo: "sowrhoop/VoidCore".to_string(),
-            pubkey_hex: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            // This is still passed via env dynamically in the installer
+            pubkey_hex: option_env!("VOIDCORE_PUBKEY").unwrap_or("0000000000000000000000000000000000000000000000000000000000000000").to_string(),
+            
             version_code: binary_version(),
         }
     }

@@ -13,18 +13,21 @@ jobs:
   build-windows:
     runs-on: windows-latest
     
+    # We map ALL secrets directly to the environment here.
+    # Cargo will bake them securely into the binaries during compilation.
     env:
       CERT_PFX: ${{ secrets.CERT_PFX }}
       CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
       VOIDCORE_PUBKEY: ${{ secrets.PUBLIC_KEY }}
       SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+      APP_WHITELIST: ${{ secrets.APP_WHITELIST }}
+      URL_BLOCKLIST: ${{ secrets.URL_BLOCKLIST }}
+      TRUSTED_PUBLISHERS: ${{ secrets.TRUSTED_PUBLISHERS }}
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Calculate Dynamic Version
-        # Extracts tag number if tagged, otherwise uses GitHub Run Number.
-        # This injects VOIDCORE_VERSION directly into the Rust build environment.
         run: |
           if ('${{ github.ref_type }}' -eq 'tag') {
               $tag = "${{ github.ref_name }}"

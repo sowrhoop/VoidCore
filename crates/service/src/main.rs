@@ -160,7 +160,6 @@ mod service_impl_enforce {
     }
 
     pub fn start_enforcement(cfg_handle: std::sync::Arc<std::sync::Mutex<RuntimeConfig>>) {
-        // Thread 1: WMI Process Watcher (Authenticode Zero-Trust)
         let cfg_handle_wmi = cfg_handle.clone();
         thread::Builder::new()
             .name("wmi-watcher".into())
@@ -229,7 +228,6 @@ mod service_impl_enforce {
                                                     allow = true;
                                                     break;
                                                 }
-                                                // Installer heuristic time-bomb
                                                 if (name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update")) 
                                                     && name_lower.contains(w) {
                                                     allow = true;
@@ -245,8 +243,6 @@ mod service_impl_enforce {
                                                 for pub_name in &cfg.trusted_publishers {
                                                     if subject_lower.contains(&pub_name.to_lowercase()) {
                                                         allow = true;
-                                                        
-                                                        // Apply time-bomb to Authenticode-verified installers too!
                                                         if name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update") {
                                                             is_ephemeral_installer = true;
                                                         }
@@ -264,7 +260,6 @@ mod service_impl_enforce {
                                         thread::Builder::new()
                                             .name(format!("timebomb-{}", pid))
                                             .spawn(move || {
-                                                // Detonate installers after 15 minutes to prevent persistent bypasses
                                                 thread::sleep(Duration::from_secs(15 * 60));
                                                 unsafe {
                                                     if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
@@ -283,7 +278,6 @@ mod service_impl_enforce {
             })
             .ok();
 
-        // Thread 2: Network & Policy Enforcer (Every 10 mins)
         let cfg_handle_main = cfg_handle.clone();
         thread::Builder::new()
             .name("main-enforce".into())
@@ -303,7 +297,6 @@ mod service_impl_enforce {
             })
             .ok();
 
-        // Thread 3: Windows Firewall Sync Loop (Every 6 hours)
         let cfg_handle_firewall = cfg_handle.clone();
         thread::Builder::new()
             .name("firewall-sync".into())
@@ -339,9 +332,7 @@ mod service_impl_enforce {
             .ok();
     }
 
-    /// OS-Level DNS Enforcement
     fn enforce_global_mullvad_dns() {
-        // 194.242.2.9 and 2a07:e340::9 are Mullvad's "All" filter IPs
         let ps = r#"
             Get-NetIPInterface | Where-Object { $_.ConnectionState -eq 'Connected' } | ForEach-Object {
                 Set-DnsClientServerAddress `
@@ -413,26 +404,25 @@ mod service_impl_enforce {
         }
     }
 
-    /// Browser-Level Policy Enforcement (DoH, Blocklist, Incognito)
     fn write_chromium_policies(blocklist: &std::collections::HashSet<String>) {
         let browsers = [
-            ("SOFTWARE\\Policies\\Google\\Chrome", "SOFTWARE\\Policies\\Google\\Chrome\\URLBlocklist"),
-            ("SOFTWARE\\Policies\\BraveSoftware\\Brave", "SOFTWARE\\Policies\\BraveSoftware\\Brave\\URLBlocklist"),
-            ("SOFTWARE\\Policies\\Microsoft\\Edge", "SOFTWARE\\Policies\\Microsoft\\Edge\\URLBlocklist"),
+            ("SOFTWARE\\Policies\\Google\\Chrome", "SOFTWARE\\Policies\\Google\\Chrome\\URLBlocklist", "SOFTWARE\\Policies\\Google\\Chrome\\ExtensionInstallBlocklist", "SOFTWARE\\Policies\\Google\\Chrome\\ExtensionInstallAllowlist"),
+            ("SOFTWARE\\Policies\\BraveSoftware\\Brave", "SOFTWARE\\Policies\\BraveSoftware\\Brave\\URLBlocklist", "SOFTWARE\\Policies\\BraveSoftware\\Brave\\ExtensionInstallBlocklist", "SOFTWARE\\Policies\\BraveSoftware\\Brave\\ExtensionInstallAllowlist"),
+            ("SOFTWARE\\Policies\\Microsoft\\Edge", "SOFTWARE\\Policies\\Microsoft\\Edge\\URLBlocklist", "SOFTWARE\\Policies\\Microsoft\\Edge\\ExtensionInstallBlocklist", "SOFTWARE\\Policies\\Microsoft\\Edge\\ExtensionInstallAllowlist"),
         ];
 
         unsafe {
-            for (policy_path, blocklist_path) in &browsers {
-                let subkey_w = to_wide(*policy_path);
+            for (base_path, bl_path, ext_block_path, ext_allow_path) in &browsers {
+                let base_w = to_wide(*base_path);
                 let mut hkey = Default::default();
-                if RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(subkey_w.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey, None).is_ok() {
-                    
-                    // 1. Disable Incognito Mode
+                
+                if RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(base_w.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey, None).is_ok() {
+                    // 1. Incognito Locked Down
                     let incognito_val: u32 = 2; // 2 = disabled
                     let inc_name = to_wide("IncognitoModeAvailability");
                     let _ = RegSetValueExW(hkey, PCWSTR(inc_name.as_ptr()), 0, REG_DWORD, Some(std::slice::from_raw_parts(&incognito_val as *const _ as *const u8, 4)));
 
-                    // 2. Force DNS-over-HTTPS (DoH) to Mullvad's "All" filter
+                    // 2. DoH Locked to Mullvad
                     let mode_val = to_wide("secure");
                     let mode_name = to_wide("DnsOverHttpsMode");
                     let _ = RegSetValueExW(hkey, PCWSTR(mode_name.as_ptr()), 0, REG_SZ, Some(std::slice::from_raw_parts(mode_val.as_ptr() as *const u8, mode_val.len() * 2)));
@@ -440,21 +430,42 @@ mod service_impl_enforce {
                     let tpl_val = to_wide("https://all.dns.mullvad.net/dns-query");
                     let tpl_name = to_wide("DnsOverHttpsTemplates");
                     let _ = RegSetValueExW(hkey, PCWSTR(tpl_name.as_ptr()), 0, REG_SZ, Some(std::slice::from_raw_parts(tpl_val.as_ptr() as *const u8, tpl_val.len() * 2)));
+                }
 
-                    // 3. Atomically replace the browser's URL blocklist
-                    let bl_w = to_wide(*blocklist_path);
-                    let _ = RegDeleteTreeW(HKEY_LOCAL_MACHINE, PCWSTR(bl_w.as_ptr()));
-                    
-                    let mut hkey_block = Default::default();
-                    if RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(bl_w.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey_block, None).is_ok() {
-                        for (index, domain) in blocklist.iter().enumerate() {
-                            let val_num_w = to_wide(&(index + 1).to_string());
-                            let pattern_w = to_wide(&format!("*{}*", domain));
-                            
-                            let pattern_bytes = std::slice::from_raw_parts(pattern_w.as_ptr() as *const u8, pattern_w.len() * 2);
-                            let _ = RegSetValueExW(hkey_block, PCWSTR(val_num_w.as_ptr()), 0, REG_SZ, Some(pattern_bytes));
-                        }
+                // 3. Blocklist Domains
+                let bl_w = to_wide(*bl_path);
+                let _ = RegDeleteTreeW(HKEY_LOCAL_MACHINE, PCWSTR(bl_w.as_ptr()));
+                let mut hkey_block = Default::default();
+                if RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(bl_w.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey_block, None).is_ok() {
+                    for (index, domain) in blocklist.iter().enumerate() {
+                        let val_num_w = to_wide(&(index + 1).to_string());
+                        let pattern_w = to_wide(&format!("*{}*", domain));
+                        let pattern_bytes = std::slice::from_raw_parts(pattern_w.as_ptr() as *const u8, pattern_w.len() * 2);
+                        let _ = RegSetValueExW(hkey_block, PCWSTR(val_num_w.as_ptr()), 0, REG_SZ, Some(pattern_bytes));
                     }
+                }
+
+                // 4. Block ALL Extensions
+                let ext_blk_w = to_wide(*ext_block_path);
+                let _ = RegDeleteTreeW(HKEY_LOCAL_MACHINE, PCWSTR(ext_blk_w.as_ptr()));
+                let mut hkey_ext_block = Default::default();
+                if RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(ext_blk_w.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey_ext_block, None).is_ok() {
+                    let val_num_w = to_wide("1");
+                    let pattern_w = to_wide("*"); // Asterisk means BLOCK ALL
+                    let pattern_bytes = std::slice::from_raw_parts(pattern_w.as_ptr() as *const u8, pattern_w.len() * 2);
+                    let _ = RegSetValueExW(hkey_ext_block, PCWSTR(val_num_w.as_ptr()), 0, REG_SZ, Some(pattern_bytes));
+                }
+
+                // 5. Explicitly ALLOW Bitwarden
+                let ext_alw_w = to_wide(*ext_allow_path);
+                let _ = RegDeleteTreeW(HKEY_LOCAL_MACHINE, PCWSTR(ext_alw_w.as_ptr()));
+                let mut hkey_ext_allow = Default::default();
+                if RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(ext_alw_w.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey_ext_allow, None).is_ok() {
+                    let val_num_w = to_wide("1");
+                    // Bitwarden Extension ID (Same across Chrome/Edge/Brave)
+                    let pattern_w = to_wide("nngceckbapebfimnlniiiahkandclblb");
+                    let pattern_bytes = std::slice::from_raw_parts(pattern_w.as_ptr() as *const u8, pattern_w.len() * 2);
+                    let _ = RegSetValueExW(hkey_ext_allow, PCWSTR(val_num_w.as_ptr()), 0, REG_SZ, Some(pattern_bytes));
                 }
             }
         }
