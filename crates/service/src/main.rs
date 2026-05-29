@@ -119,13 +119,14 @@ mod service_impl_enforce {
     use std::os::windows::ffi::OsStrExt;
     use std::thread;
     use std::time::Duration;
+    use std::net::ToSocketAddrs;
     use voidcore_shared::RuntimeConfig;
     use wmi::{COMLibrary, WMIConnection};
     use serde::Deserialize;
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, PROCESS_NAME_WIN32};
     use windows::Win32::NetworkManagement::NetManagement::{NetUserSetInfo, USER_INFO_1003};
-    use windows::Win32::System::Registry::{RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, REG_SZ, REG_OPTION_NON_VOLATILE};
+    use windows::Win32::System::Registry::{RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, REG_SZ, REG_DWORD, REG_OPTION_NON_VOLATILE};
 
     #[allow(non_camel_case_types)]
     #[derive(Deserialize, Debug)]
@@ -139,12 +140,10 @@ mod service_impl_enforce {
         OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
     }
 
-    /// Evaluates the digital signature of an executable using the Windows CryptoAPI.
-    /// Returns the Subject Name only if the signature is cryptographically valid.
     fn get_authenticode_publisher(path: &str) -> Option<String> {
         let script = format!(
             "$s = Get-AuthenticodeSignature -LiteralPath '{}'; if ($s.Status -eq 'Valid') {{ $s.SignerCertificate.Subject }}",
-            path.replace("'", "''") // Securely escape single quotes in path
+            path.replace("'", "''") 
         );
         let output = std::process::Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
@@ -161,6 +160,7 @@ mod service_impl_enforce {
     }
 
     pub fn start_enforcement(cfg_handle: std::sync::Arc<std::sync::Mutex<RuntimeConfig>>) {
+        // Thread 1: WMI Process Watcher (Authenticode Zero-Trust)
         let cfg_handle_wmi = cfg_handle.clone();
         thread::Builder::new()
             .name("wmi-watcher".into())
@@ -181,24 +181,20 @@ mod service_impl_enforce {
                             let cfg = cfg_handle_wmi.lock().map(|c| c.clone()).unwrap_or_default();
                             
                             let mut allow = false;
+                            let mut is_ephemeral_installer = false;
 
                             let critical = ["system","smss","csrss","wininit","winlogon","lsass","services","svchost","voidcore-service", "voidcore-gui"];
-                            if critical.contains(&name_lower.as_str()) {
-                                continue;
-                            }
+                            if critical.contains(&name_lower.as_str()) { continue; }
 
                             unsafe {
-                                // Open handle with BOTH Query and Terminate rights up front.
                                 if let Ok(proc_handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, false, trace.process_id) {
                                     let mut buffer = [0u16; 1024];
                                     let mut size = buffer.len() as u32;
                                     
-                                    // QueryFullProcessImageNameW gets the true DOS path (C:\...) required for signature verification
                                     if QueryFullProcessImageNameW(proc_handle, PROCESS_NAME_WIN32, PWSTR(buffer.as_mut_ptr()), &mut size).is_ok() {
                                         let path = String::from_utf16_lossy(&buffer[..size as usize]);
                                         let path_lower = path.to_lowercase();
                                         
-                                        // SMART ZONE 1: Immutable Windows Paths
                                         if path_lower.contains("\\windows\\system32\\") || 
                                            path_lower.contains("\\windows\\syswow64\\") || 
                                            path_lower.contains("\\windows\\systemapps\\") ||
@@ -208,7 +204,6 @@ mod service_impl_enforce {
                                             allow = true;
                                         }
 
-                                        // SMART ZONE 2: Trusted Developer AppData Paths
                                         let trusted_paths = [
                                             "\\appdata\\local\\programs\\",
                                             "\\appdata\\roaming\\npm\\",
@@ -223,27 +218,38 @@ mod service_impl_enforce {
                                             }
                                         }
 
-                                        // JUNK OVERRIDE: Block gaming platforms from impersonating anything
                                         let junk = ["steam", "epicgameslauncher", "xboxapp", "gamebar", "riotclient"];
                                         for j in &junk {
-                                            if name_lower.contains(j) {
-                                                allow = false;
-                                            }
+                                            if name_lower.contains(j) { allow = false; }
                                         }
 
-                                        // NAME WHITELIST: Direct Name Matches
-                                        if !allow && cfg.whitelist.contains(&name_lower) {
-                                            allow = true;
+                                        if !allow {
+                                            for w in &cfg.whitelist {
+                                                if name_lower == *w {
+                                                    allow = true;
+                                                    break;
+                                                }
+                                                // Installer heuristic time-bomb
+                                                if (name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update")) 
+                                                    && name_lower.contains(w) {
+                                                    allow = true;
+                                                    is_ephemeral_installer = true;
+                                                    break;
+                                                }
+                                            }
                                         }
                                         
-                                        // SMART ZONE 3: ZERO-TRUST AUTHENTICODE VALIDATION
-                                        // If an unwhitelisted process tries to run, check its digital signature!
                                         if !allow && !cfg.trusted_publishers.is_empty() {
                                             if let Some(subject) = get_authenticode_publisher(&path) {
                                                 let subject_lower = subject.to_lowercase();
                                                 for pub_name in &cfg.trusted_publishers {
                                                     if subject_lower.contains(&pub_name.to_lowercase()) {
                                                         allow = true;
+                                                        
+                                                        // Apply time-bomb to Authenticode-verified installers too!
+                                                        if name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update") {
+                                                            is_ephemeral_installer = true;
+                                                        }
                                                         break;
                                                     }
                                                 }
@@ -251,9 +257,22 @@ mod service_impl_enforce {
                                         }
                                     }
 
-                                    // EXECUTION: Terminate using the exact same handle if it failed all checks
                                     if !allow {
                                         let _ = TerminateProcess(proc_handle, 1);
+                                    } else if is_ephemeral_installer {
+                                        let pid = trace.process_id;
+                                        thread::Builder::new()
+                                            .name(format!("timebomb-{}", pid))
+                                            .spawn(move || {
+                                                // Detonate installers after 15 minutes to prevent persistent bypasses
+                                                thread::sleep(Duration::from_secs(15 * 60));
+                                                unsafe {
+                                                    if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+                                                        let _ = TerminateProcess(bomb_handle, 1);
+                                                        let _ = windows::Win32::Foundation::CloseHandle(bomb_handle);
+                                                    }
+                                                }
+                                            }).ok();
                                     }
                                     let _ = windows::Win32::Foundation::CloseHandle(proc_handle);
                                 }
@@ -264,20 +283,74 @@ mod service_impl_enforce {
             })
             .ok();
 
+        // Thread 2: Network & Policy Enforcer (Every 10 mins)
         let cfg_handle_main = cfg_handle.clone();
         thread::Builder::new()
             .name("main-enforce".into())
             .spawn(move || {
                 loop {
                     let cfg = cfg_handle_main.lock().map(|c| c.clone()).unwrap_or_default();
+                    
+                    enforce_global_mullvad_dns();
                     write_hosts_file(&cfg.url_blocklist);
                     write_chromium_policies(&cfg.url_blocklist);
+                    
                     rotate_local_admin_password();
                     purge_all_other_administrators();
+                    
                     thread::sleep(Duration::from_secs(10 * 60)); 
                 }
             })
             .ok();
+
+        // Thread 3: Windows Firewall Sync Loop (Every 6 hours)
+        let cfg_handle_firewall = cfg_handle.clone();
+        thread::Builder::new()
+            .name("firewall-sync".into())
+            .spawn(move || {
+                loop {
+                    let blocklist = cfg_handle_firewall.lock().map(|c| c.url_blocklist.clone()).unwrap_or_default();
+                    let mut ips: HashSet<String> = HashSet::new();
+                    
+                    for domain in &blocklist {
+                        if let Ok(addrs) = format!("{}:443", domain).to_socket_addrs() {
+                            for addr in addrs { ips.insert(addr.ip().to_string()); }
+                        }
+                        if let Ok(addrs) = format!("{}:80", domain).to_socket_addrs() {
+                            for addr in addrs { ips.insert(addr.ip().to_string()); }
+                        }
+                    }
+
+                    if !ips.is_empty() {
+                        let ip_list = ips.iter().map(|ip| format!("'{}'", ip)).collect::<Vec<_>>().join(",");
+                        let ps = format!(
+                            "Remove-NetFirewallRule -DisplayName 'VoidCore Outbound Block' -ErrorAction SilentlyContinue; \
+                             New-NetFirewallRule -DisplayName 'VoidCore Outbound Block' \
+                               -Direction Outbound -Action Block \
+                               -RemoteAddress @({}) \
+                               -ErrorAction SilentlyContinue", ip_list
+                        );
+                        let _ = std::process::Command::new("powershell").args(["-NoProfile","-NonInteractive","-WindowStyle","Hidden","-Command", &ps]).output();
+                    }
+                    
+                    thread::sleep(Duration::from_secs(6 * 3600));
+                }
+            })
+            .ok();
+    }
+
+    /// OS-Level DNS Enforcement
+    fn enforce_global_mullvad_dns() {
+        // 194.242.2.9 and 2a07:e340::9 are Mullvad's "All" filter IPs
+        let ps = r#"
+            Get-NetIPInterface | Where-Object { $_.ConnectionState -eq 'Connected' } | ForEach-Object {
+                Set-DnsClientServerAddress `
+                    -InterfaceIndex $_.InterfaceIndex `
+                    -ServerAddresses ('194.242.2.9','2a07:e340::9') `
+                    -ErrorAction SilentlyContinue
+            }
+        "#;
+        let _ = std::process::Command::new("powershell").args(["-NoProfile","-NonInteractive","-WindowStyle","Hidden","-Command", ps]).output();
     }
 
     fn rotate_local_admin_password() {
@@ -340,30 +413,47 @@ mod service_impl_enforce {
         }
     }
 
+    /// Browser-Level Policy Enforcement (DoH, Blocklist, Incognito)
     fn write_chromium_policies(blocklist: &std::collections::HashSet<String>) {
         let browsers = [
-            ("SOFTWARE\\Policies\\Google\\Chrome", "SOFTWARE\\Policies\\Google\\Chrome\\URLBlocklist", "IncognitoModeAvailability"),
-            ("SOFTWARE\\Policies\\BraveSoftware\\Brave", "SOFTWARE\\Policies\\BraveSoftware\\Brave\\URLBlocklist", "IncognitoModeAvailability"),
-            ("SOFTWARE\\Policies\\Microsoft\\Edge", "SOFTWARE\\Policies\\Microsoft\\Edge\\URLBlocklist", "InPrivateModeAvailability"),
+            ("SOFTWARE\\Policies\\Google\\Chrome", "SOFTWARE\\Policies\\Google\\Chrome\\URLBlocklist"),
+            ("SOFTWARE\\Policies\\BraveSoftware\\Brave", "SOFTWARE\\Policies\\BraveSoftware\\Brave\\URLBlocklist"),
+            ("SOFTWARE\\Policies\\Microsoft\\Edge", "SOFTWARE\\Policies\\Microsoft\\Edge\\URLBlocklist"),
         ];
 
         unsafe {
-            for (policy_path, blocklist_path, _incognito_key) in &browsers {
+            for (policy_path, blocklist_path) in &browsers {
                 let subkey_w = to_wide(*policy_path);
                 let mut hkey = Default::default();
-                let _ = RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(subkey_w.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey, None);
+                if RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(subkey_w.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey, None).is_ok() {
+                    
+                    // 1. Disable Incognito Mode
+                    let incognito_val: u32 = 2; // 2 = disabled
+                    let inc_name = to_wide("IncognitoModeAvailability");
+                    let _ = RegSetValueExW(hkey, PCWSTR(inc_name.as_ptr()), 0, REG_DWORD, Some(std::slice::from_raw_parts(&incognito_val as *const _ as *const u8, 4)));
 
-                let bl_w = to_wide(*blocklist_path);
-                let _ = RegDeleteTreeW(HKEY_LOCAL_MACHINE, PCWSTR(bl_w.as_ptr()));
-                
-                let mut hkey_block = Default::default();
-                if RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(bl_w.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey_block, None).is_ok() {
-                    for (index, domain) in blocklist.iter().enumerate() {
-                        let val_num_w = to_wide(&(index + 1).to_string());
-                        let pattern_w = to_wide(&format!("*{}*", domain));
-                        
-                        let pattern_bytes = std::slice::from_raw_parts(pattern_w.as_ptr() as *const u8, pattern_w.len() * 2);
-                        let _ = RegSetValueExW(hkey_block, PCWSTR(val_num_w.as_ptr()), 0, REG_SZ, Some(pattern_bytes));
+                    // 2. Force DNS-over-HTTPS (DoH) to Mullvad's "All" filter
+                    let mode_val = to_wide("secure");
+                    let mode_name = to_wide("DnsOverHttpsMode");
+                    let _ = RegSetValueExW(hkey, PCWSTR(mode_name.as_ptr()), 0, REG_SZ, Some(std::slice::from_raw_parts(mode_val.as_ptr() as *const u8, mode_val.len() * 2)));
+
+                    let tpl_val = to_wide("https://all.dns.mullvad.net/dns-query");
+                    let tpl_name = to_wide("DnsOverHttpsTemplates");
+                    let _ = RegSetValueExW(hkey, PCWSTR(tpl_name.as_ptr()), 0, REG_SZ, Some(std::slice::from_raw_parts(tpl_val.as_ptr() as *const u8, tpl_val.len() * 2)));
+
+                    // 3. Atomically replace the browser's URL blocklist
+                    let bl_w = to_wide(*blocklist_path);
+                    let _ = RegDeleteTreeW(HKEY_LOCAL_MACHINE, PCWSTR(bl_w.as_ptr()));
+                    
+                    let mut hkey_block = Default::default();
+                    if RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(bl_w.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey_block, None).is_ok() {
+                        for (index, domain) in blocklist.iter().enumerate() {
+                            let val_num_w = to_wide(&(index + 1).to_string());
+                            let pattern_w = to_wide(&format!("*{}*", domain));
+                            
+                            let pattern_bytes = std::slice::from_raw_parts(pattern_w.as_ptr() as *const u8, pattern_w.len() * 2);
+                            let _ = RegSetValueExW(hkey_block, PCWSTR(val_num_w.as_ptr()), 0, REG_SZ, Some(pattern_bytes));
+                        }
                     }
                 }
             }
