@@ -143,21 +143,24 @@ mod service_impl_enforce {
     /// Crosses the Session 0 boundary to instantly pop a native notification on the active user's screen
     fn notify_user(title_str: &str, msg_str: &str) {
         unsafe {
-            use windows::Win32::System::RemoteDesktop::{WTSSendMessageW, WTS_ACTIVE_SESSION_ID};
+            use windows::Win32::System::RemoteDesktop::WTSSendMessageW;
+            use windows::Win32::UI::WindowsAndMessaging::{MESSAGEBOX_STYLE, MESSAGEBOX_RESULT};
             use windows::Win32::Foundation::HANDLE;
             
             let title = to_wide(title_str);
             let msg = to_wide(msg_str);
-            let mut response: u32 = 0;
+            
+            // Strongly typed MessageBox response
+            let mut response = MESSAGEBOX_RESULT(0);
             
             let _ = WTSSendMessageW(
                 HANDLE(0), // WTS_CURRENT_SERVER_HANDLE
-                WTS_ACTIVE_SESSION_ID,
+                0xFFFFFFFF, // Literal constant for WTS_ACTIVE_SESSION_ID
                 PCWSTR(title.as_ptr()),
                 (title.len() * 2) as u32,
                 PCWSTR(msg.as_ptr()),
                 (msg.len() * 2) as u32,
-                0x00000030, // MB_ICONEXCLAMATION
+                MESSAGEBOX_STYLE(0x00000030), // MB_ICONEXCLAMATION strongly typed
                 5, // Timeout
                 &mut response,
                 windows::Win32::Foundation::BOOL(0), // Don't wait for user response
@@ -284,7 +287,6 @@ mod service_impl_enforce {
                                         let _ = TerminateProcess(proc_handle, 1);
                                         crate::logging::log_event("enforce", "BLOCK", &format!("Terminated unauthorised process: {}", name_lower));
                                         
-                                        // Rate limit popups to 1 per minute per app
                                         let now = Instant::now();
                                         if last_notified.get(&name_lower).map(|t| now.duration_since(*t).as_secs() > 60).unwrap_or(true) {
                                             notify_user("VoidCore Enforcer", &format!("Process Terminated:\n{}\n\nNot on whitelist or trusted publisher list.", trace.process_name));
@@ -305,18 +307,17 @@ mod service_impl_enforce {
                                             .name(format!("timebomb-{}", pid))
                                             .spawn(move || {
                                                 thread::sleep(Duration::from_secs(15 * 60));
-                                                unsafe {
-                                                    if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
-                                                        let _ = TerminateProcess(bomb_handle, 1);
-                                                        let _ = windows::Win32::Foundation::CloseHandle(bomb_handle);
-                                                        crate::logging::log_event("enforce", "BLOCK", "Timebomb detonated installer.");
-                                                    }
+                                                // Removed redundant unsafe block here to fix compiler warning
+                                                if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+                                                    let _ = TerminateProcess(bomb_handle, 1);
+                                                    let _ = windows::Win32::Foundation::CloseHandle(bomb_handle);
+                                                    crate::logging::log_event("enforce", "BLOCK", "Timebomb detonated installer.");
                                                 }
                                             }).ok();
                                     }
                                     let _ = windows::Win32::Foundation::CloseHandle(proc_handle);
                                 }
-                            }
+                            } // End of outer unsafe block
                         }
                     }
                 };
