@@ -285,7 +285,6 @@ mod service_impl_enforce {
 
                                     if !allow {
                                         let _ = TerminateProcess(proc_handle, 1);
-                                        // FIXED: Explicitly handle the Result by silencing the warning
                                         let _ = crate::logging::log_event("enforce", "BLOCK", &format!("Terminated: {}", name_lower));
                                         
                                         let now = Instant::now();
@@ -295,7 +294,6 @@ mod service_impl_enforce {
                                         }
                                         
                                     } else if is_ephemeral_installer {
-                                        // FIXED: Explicitly handle the Result by silencing the warning
                                         let _ = crate::logging::log_event("enforce", "ALLOW", &format!("Timebomb applied: {} ({})", name_lower, reason));
                                         
                                         let now = Instant::now();
@@ -307,16 +305,14 @@ mod service_impl_enforce {
                                         let pid = trace.process_id;
                                         thread::Builder::new().name(format!("timebomb-{}", pid)).spawn(move || {
                                             thread::sleep(Duration::from_secs(15 * 60));
-                                            unsafe {
-                                                if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
-                                                    let mut code = 0;
-                                                    if GetExitCodeProcess(bomb_handle, &mut code).is_ok() && code == 259 {
-                                                        let _ = TerminateProcess(bomb_handle, 1);
-                                                        // FIXED: Explicitly handle the Result by silencing the warning
-                                                        let _ = crate::logging::log_event("enforce", "BLOCK", "Timebomb detonated installer after 15m limit.");
-                                                    }
-                                                    let _ = windows::Win32::Foundation::CloseHandle(bomb_handle);
+                                            // Completely removed the redundant unsafe block here
+                                            if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+                                                let mut code = 0;
+                                                if GetExitCodeProcess(bomb_handle, &mut code).is_ok() && code == 259 {
+                                                    let _ = TerminateProcess(bomb_handle, 1);
+                                                    let _ = crate::logging::log_event("enforce", "BLOCK", "Timebomb detonated installer after 15m limit.");
                                                 }
+                                                let _ = windows::Win32::Foundation::CloseHandle(bomb_handle);
                                             }
                                         }).ok();
                                     }
