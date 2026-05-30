@@ -479,6 +479,31 @@ fn grant_users_snapshot_access() {
         .args([SNAPSHOT_DIR, "/grant", "*S-1-5-32-545:(OI)(CI)M"])
         .creation_flags(CREATE_NO_WINDOW)
         .status();
+    let _ = std::process::Command::new("icacls")
+        .args([SNAPSHOT_DIR, "/grant", "Everyone:(OI)(CI)M"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+}
+
+unsafe fn path_from_env_block(env: *mut std::ffi::c_void, key: &str) -> Option<std::path::PathBuf> {
+    let mut p = env as *const u16;
+    while *p != 0 {
+        let start = p;
+        while *p != 0 {
+            p = p.add(1);
+        }
+        let len = p.offset_from(start) as usize;
+        if len > 0 {
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(start, len));
+            if let Some((k, v)) = s.split_once('=') {
+                if k.eq_ignore_ascii_case(key) && !v.is_empty() {
+                    return Some(std::path::PathBuf::from(v));
+                }
+            }
+        }
+        p = p.add(1);
+    }
+    None
 }
 
 fn prepare_snapshot_path() -> Result<std::path::PathBuf, String> {
@@ -495,13 +520,7 @@ fn capture_via_user_session_helper() -> Result<Option<RgbaImage>, String> {
         return Ok(None);
     }
 
-    let snapshot_path = prepare_snapshot_path()?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let cmd = format!(
-        "\"{}\" --vision-snapshot \"{}\"",
-        exe.display(),
-        snapshot_path.display()
-    );
 
     unsafe {
         use windows::core::{PCWSTR, PWSTR};
@@ -522,6 +541,19 @@ fn capture_via_user_session_helper() -> Result<Option<RgbaImage>, String> {
             let _ = CloseHandle(user_token);
             return Err("CreateEnvironmentBlock failed".into());
         }
+
+        let snapshot_path = path_from_env_block(env_block, "TEMP")
+            .or_else(|| path_from_env_block(env_block, "TMP"))
+            .map(|dir| dir.join(format!("voidcore-snap-{session}.png")))
+            .or_else(|| prepare_snapshot_path().ok())
+            .ok_or("could not resolve snapshot path")?;
+        let _ = std::fs::remove_file(&snapshot_path);
+
+        let cmd = format!(
+            "\"{}\" --vision-snapshot \"{}\"",
+            exe.display(),
+            snapshot_path.display()
+        );
 
         let mut exe_wide = to_wide(&exe.to_string_lossy());
         let mut cmd_wide = to_wide(&cmd);
@@ -569,20 +601,20 @@ fn capture_via_user_session_helper() -> Result<Option<RgbaImage>, String> {
                 snapshot_path.display()
             ));
         }
-    }
 
-    if !snapshot_path.exists() {
-        return Err(format!(
-            "snapshot file missing at {}",
-            snapshot_path.display()
-        ));
-    }
+        if !snapshot_path.exists() {
+            return Err(format!(
+                "snapshot file missing at {}",
+                snapshot_path.display()
+            ));
+        }
 
-    let img = image::open(&snapshot_path)
-        .map_err(|e| e.to_string())?
-        .to_rgba8();
-    let _ = std::fs::remove_file(&snapshot_path);
-    Ok(Some(img))
+        let img = image::open(&snapshot_path)
+            .map_err(|e| e.to_string())?
+            .to_rgba8();
+        let _ = std::fs::remove_file(&snapshot_path);
+        return Ok(Some(img));
+    }
 }
 
 fn to_wide(s: &str) -> Vec<u16> {

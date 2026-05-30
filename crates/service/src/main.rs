@@ -198,6 +198,7 @@ mod service_impl_enforce {
                 };
                 
                 let mut last_notified: HashMap<String, Instant> = HashMap::new();
+                let mut last_block_log: HashMap<String, Instant> = HashMap::new();
                 let mut signature_cache: HashMap<String, String> = HashMap::new();
                 let wmi_con = WMIConnection::new(com).unwrap();
                 
@@ -214,8 +215,10 @@ mod service_impl_enforce {
                             let critical = [
                                 "system","smss","csrss","wininit","winlogon","lsass","services","svchost",
                                 "explorer","taskhostw","dwm","searchhost","startmenuexperiencehost",
-                                "shellexperiencehost","sihost","ctfmon","voidcore-service", "voidcore-gui", 
-                                "voidcore-setup", "conhost", "cmd"
+                                "shellexperiencehost","sihost","ctfmon","voidcore-service", "voidcore-gui",
+                                "voidcore-setup", "conhost", "cmd",
+                                "shellhost", "smartscreen", "searchprotocolhost", "searchindexer",
+                                "runtimebroker", "backgroundtaskhost", "textinputhost", "dllhost",
                             ];
                             if critical.contains(&name_lower.as_str()) { continue; }
 
@@ -239,18 +242,22 @@ mod service_impl_enforce {
                                             let path = String::from_utf16_lossy(&buffer[..size as usize]);
                                             let path_lower = path.to_lowercase();
                                             
-                                            // 🛡️ TIER 1: Immutable OS Paths (ACL Trust)
-                                            let is_core_os = path_lower == "c:\\windows\\explorer.exe" ||
-                                                             path_lower.starts_with("c:\\windows\\system32\\") ||
-                                                             path_lower.starts_with("c:\\windows\\syswow64\\") ||
-                                                             path_lower.starts_with("c:\\windows\\systemapps\\") ||
-                                                             path_lower.starts_with("c:\\windows\\immersivecontrolpanel\\") ||
-                                                             path_lower.starts_with("c:\\program files\\") ||
-                                                             path_lower.starts_with("c:\\program files (x86)\\");
+                                            // 🛡️ TIER 1: Windows OS directories — always allow (shellhost, smartscreen, etc.)
+                                            let is_windows_os = path_lower == "c:\\windows\\explorer.exe"
+                                                || path_lower.starts_with("c:\\windows\\system32\\")
+                                                || path_lower.starts_with("c:\\windows\\syswow64\\")
+                                                || path_lower.starts_with("c:\\windows\\systemapps\\")
+                                                || path_lower.starts_with("c:\\windows\\immersivecontrolpanel\\");
 
-                                            if is_core_os && cfg.whitelist.contains(&name_lower) {
+                                            let is_program_files = path_lower.starts_with("c:\\program files\\")
+                                                || path_lower.starts_with("c:\\program files (x86)\\");
+
+                                            if is_windows_os {
                                                 allow = true;
-                                                reason = "ACL Protected Directory + Whitelist".to_string();
+                                                reason = "Windows OS component".to_string();
+                                            } else if is_program_files && cfg.whitelist.contains(&name_lower) {
+                                                allow = true;
+                                                reason = "Program Files + Whitelist".to_string();
                                             }
 
                                             // 🛡️ TIER 2: User-Space Zero Trust (Cryptographic Verification)
@@ -292,9 +299,20 @@ mod service_impl_enforce {
 
                                     if !allow {
                                         let _ = TerminateProcess(proc_handle, 1);
-                                        let _ = crate::logging::log_event("enforce", "BLOCK", &format!("Terminated: {}", name_lower));
-                                        
                                         let now = Instant::now();
+                                        if last_block_log
+                                            .get(&name_lower)
+                                            .map(|t| now.duration_since(*t).as_secs() > 60)
+                                            .unwrap_or(true)
+                                        {
+                                            let _ = crate::logging::log_event(
+                                                "enforce",
+                                                "BLOCK",
+                                                &format!("Terminated: {}", name_lower),
+                                            );
+                                            last_block_log.insert(name_lower.clone(), now);
+                                        }
+
                                         if last_notified.get(&name_lower).map(|t| now.duration_since(*t).as_secs() > 60).unwrap_or(true) {
                                             notify_user("VoidCore Security Guard", &format!("Blocked Execution:\n{}\n\nReason: Executable is not in an ACL-protected directory and lacks a valid Trusted Publisher signature.", trace.process_name));
                                             last_notified.insert(name_lower.clone(), now);
