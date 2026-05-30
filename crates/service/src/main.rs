@@ -205,27 +205,17 @@ mod service_impl_enforce {
                             let mut is_ephemeral_installer = false;
                             let mut reason = String::new();
 
-                            let critical = ["system","smss","csrss","wininit","winlogon","lsass","services","svchost","voidcore-service", "voidcore-gui", "voidcore-setup", "conhost", "cmd"];
+                            // 🚨 PREVENT DESKTOP CRASHES: Explicit UI Exclusion
+                            let critical = [
+                                "system","smss","csrss","wininit","winlogon","lsass","services","svchost",
+                                "explorer","taskhostw","dwm","searchhost","startmenuexperiencehost",
+                                "shellexperiencehost","sihost","ctfmon","voidcore-service", "voidcore-gui", 
+                                "voidcore-setup", "conhost", "cmd"
+                            ];
                             if critical.contains(&name_lower.as_str()) { continue; }
 
                             let junk = ["steam", "epicgameslauncher", "xboxapp", "gamebar", "riotclient"];
                             let is_junk = junk.iter().any(|j| name_lower.contains(j));
-
-                            if !is_junk {
-                                if cfg.whitelist.contains(&name_lower) {
-                                    allow = true;
-                                } else {
-                                    for w in &cfg.whitelist {
-                                        if (name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update")) 
-                                            && name_lower.contains(w) {
-                                            allow = true;
-                                            is_ephemeral_installer = true;
-                                            reason = format!("Heuristic match: {}", w);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
 
                             unsafe {
                                 if let Ok(proc_handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, false, trace.process_id) {
@@ -236,7 +226,7 @@ mod service_impl_enforce {
                                         continue; 
                                     }
 
-                                    if !allow && !is_junk {
+                                    if !is_junk {
                                         let mut buffer = [0u16; 1024];
                                         let mut size = buffer.len() as u32;
                                         
@@ -244,15 +234,42 @@ mod service_impl_enforce {
                                             let path = String::from_utf16_lossy(&buffer[..size as usize]);
                                             let path_lower = path.to_lowercase();
                                             
-                                            let is_protected_dir = path_lower.starts_with("c:\\windows\\") || 
-                                                                   path_lower.starts_with("c:\\program files\\") || 
-                                                                   path_lower.starts_with("c:\\program files (x86)\\");
+                                            // 🛡️ TIER 1: Immutable OS Paths (UNCONDITIONAL ALLOW)
+                                            // Standard Users cannot write malware into these folders.
+                                            let is_core_os = path_lower == "c:\\windows\\explorer.exe" ||
+                                                             path_lower.starts_with("c:\\windows\\system32\\") ||
+                                                             path_lower.starts_with("c:\\windows\\syswow64\\") ||
+                                                             path_lower.starts_with("c:\\windows\\systemapps\\") ||
+                                                             path_lower.starts_with("c:\\windows\\immersivecontrolpanel\\") ||
+                                                             path_lower.starts_with("c:\\program files\\windowsapps\\");
 
-                                            if is_protected_dir && cfg.whitelist.contains(&name_lower) {
+                                            if is_core_os {
                                                 allow = true;
-                                                reason = "Whitelisted & ACL Protected".to_string();
+                                                reason = "Core OS Component".to_string();
                                             }
-                                            
+
+                                            // 🛡️ TIER 2: Direct Whitelist Matches
+                                            if !allow && cfg.whitelist.contains(&name_lower) {
+                                                allow = true;
+                                                reason = "Explicit Whitelist".to_string();
+                                            }
+
+                                            // 🛡️ TIER 3: Trusted Path Heuristics
+                                            if !allow {
+                                                let trusted_paths = [
+                                                    "\\appdata\\local\\programs\\",
+                                                    "\\appdata\\roaming\\npm\\",
+                                                    "\\appdata\\local\\npm\\",
+                                                    "\\bravesoftware\\",
+                                                    "\\vscodium\\",
+                                                ];
+                                                if trusted_paths.iter().any(|tp| path_lower.contains(tp)) {
+                                                    allow = true;
+                                                    reason = "Trusted AppData Path".to_string();
+                                                }
+                                            }
+
+                                            // 🛡️ TIER 4: Cryptographic Publisher Verification
                                             if !allow && !cfg.trusted_publishers.is_empty() {
                                                 let subject_opt = if let Some(cached_subj) = signature_cache.get(&path_lower) {
                                                     Some(cached_subj.clone())
@@ -268,18 +285,27 @@ mod service_impl_enforce {
                                                     let subject_lower = subject.to_lowercase();
                                                     for pub_name in &cfg.trusted_publishers {
                                                         if subject_lower.contains(&pub_name.to_lowercase()) {
-                                                            if cfg.whitelist.contains(&name_lower) {
-                                                                allow = true;
-                                                                reason = format!("Trusted Publisher Verified: {}", pub_name);
-                                                                break;
-                                                            }
+                                                            allow = true; // Trusting Publisher implicitly allows the app!
+                                                            reason = format!("Trusted Publisher Verified: {}", pub_name);
+                                                            
                                                             if name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update") {
-                                                                allow = true;
                                                                 is_ephemeral_installer = true;
-                                                                reason = format!("Verified Installer: {}", pub_name);
-                                                                break;
                                                             }
+                                                            break;
                                                         }
+                                                    }
+                                                }
+                                            }
+                                            
+                                            // 🛡️ TIER 5: Heuristic Installer Matching
+                                            if !allow {
+                                                for w in &cfg.whitelist {
+                                                    if (name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update")) 
+                                                        && name_lower.contains(w) {
+                                                        allow = true;
+                                                        is_ephemeral_installer = true;
+                                                        reason = format!("Heuristic match: {}", w);
+                                                        break;
                                                     }
                                                 }
                                             }
@@ -308,14 +334,15 @@ mod service_impl_enforce {
                                         let pid = trace.process_id;
                                         thread::Builder::new().name(format!("timebomb-{}", pid)).spawn(move || {
                                             thread::sleep(Duration::from_secs(15 * 60));
-                                            // Redundant unsafe block removed
-                                            if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
-                                                let mut code = 0;
-                                                if GetExitCodeProcess(bomb_handle, &mut code).is_ok() && code == 259 {
-                                                    let _ = TerminateProcess(bomb_handle, 1);
-                                                    let _ = crate::logging::log_event("enforce", "BLOCK", "Timebomb detonated installer after 15m limit.");
+                                            unsafe {
+                                                if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+                                                    let mut code = 0;
+                                                    if GetExitCodeProcess(bomb_handle, &mut code).is_ok() && code == 259 {
+                                                        let _ = TerminateProcess(bomb_handle, 1);
+                                                        let _ = crate::logging::log_event("enforce", "BLOCK", "Timebomb detonated installer after 15m limit.");
+                                                    }
+                                                    let _ = windows::Win32::Foundation::CloseHandle(bomb_handle);
                                                 }
-                                                let _ = windows::Win32::Foundation::CloseHandle(bomb_handle);
                                             }
                                         }).ok();
                                     }
@@ -755,7 +782,6 @@ mod service_impl_ipc {
                                         if OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut sys_token).is_ok() {
                                             
                                             let mut dup_token = HANDLE(0);
-                                            // FIXED: Passing TOKEN_ALL_ACCESS directly as TOKEN_ACCESS_MASK
                                             if DuplicateTokenEx(
                                                 sys_token,
                                                 TOKEN_ALL_ACCESS,
@@ -981,4 +1007,4 @@ mod service_impl_updater {
             }
         }
     }
-}
+        }
