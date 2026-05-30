@@ -82,12 +82,14 @@ fn main() {
 struct LogEntry {
     timestamp: i64,
     time: String,
-    source: &'static str,
+    source: String,
     action: String,
     message: String,
 }
 
-fn parse_audit_line(line: &str) -> Option<(i64, String, String)> {
+const LOG_DIR: &str = r"C:\ProgramData\VoidCore\logs";
+
+fn parse_log_line(line: &str) -> Option<(i64, String, String)> {
     let parts: Vec<&str> = line.splitn(3, ' ').collect();
     if parts.len() != 3 {
         return None;
@@ -98,7 +100,7 @@ fn parse_audit_line(line: &str) -> Option<(i64, String, String)> {
     Some((timestamp, action, message))
 }
 
-fn load_audit_log(path: &str, source: &'static str, actions: Option<&[&str]>) -> Vec<LogEntry> {
+fn load_log_file(path: &str, source: &str, actions: Option<&[&str]>) -> Vec<LogEntry> {
     let content = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return vec![],
@@ -106,7 +108,7 @@ fn load_audit_log(path: &str, source: &'static str, actions: Option<&[&str]>) ->
 
     let mut entries = Vec::new();
     for line in content.lines() {
-        let Some((timestamp, action, message)) = parse_audit_line(line) else {
+        let Some((timestamp, action, message)) = parse_log_line(line) else {
             continue;
         };
         if let Some(allowed) = actions {
@@ -121,12 +123,38 @@ fn load_audit_log(path: &str, source: &'static str, actions: Option<&[&str]>) ->
         entries.push(LogEntry {
             timestamp,
             time,
-            source,
+            source: source.to_string(),
             action,
             message,
         });
     }
     entries
+}
+
+fn load_all_voidcore_logs(limit: usize) -> Vec<LogEntry> {
+    let mut entries = Vec::new();
+    if let Ok(dir) = fs::read_dir(LOG_DIR) {
+        for entry in dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("log") {
+                continue;
+            }
+            let Some(source) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            entries.extend(load_log_file(
+                &path.to_string_lossy(),
+                source,
+                None,
+            ));
+        }
+    }
+    entries.sort_by_key(|e| e.timestamp);
+    if entries.len() > limit {
+        entries.split_off(entries.len() - limit)
+    } else {
+        entries
+    }
 }
 
 struct VoidCoreApp {
@@ -138,7 +166,10 @@ struct VoidCoreApp {
     elevate_path: String,
     config: RuntimeConfig,
     logs: Vec<LogEntry>,
+    live_logs: Vec<LogEntry>,
+    live_logs_follow: bool,
     last_status_refresh: f64,
+    last_live_log_refresh: f64,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -187,10 +218,14 @@ impl VoidCoreApp {
             elevate_path: String::new(),
             config,
             logs: vec![],
+            live_logs: vec![],
+            live_logs_follow: true,
             last_status_refresh: 0.0,
+            last_live_log_refresh: 0.0,
         };
 
         app.reload_logs();
+        app.reload_live_logs();
         app
     }
 
@@ -198,12 +233,16 @@ impl VoidCoreApp {
         const ENFORCE_LOG: &str = r"C:\ProgramData\VoidCore\logs\enforce.log";
         const VISION_LOG: &str = r"C:\ProgramData\VoidCore\logs\vision.log";
 
-        let mut entries = load_audit_log(ENFORCE_LOG, "enforce", None);
-        entries.extend(load_audit_log(VISION_LOG, "vision", Some(&["BLOCK"])));
+        let mut entries = load_log_file(ENFORCE_LOG, "enforce", None);
+        entries.extend(load_log_file(VISION_LOG, "vision", Some(&["BLOCK"])));
 
         entries.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
         entries.truncate(150);
         self.logs = entries;
+    }
+
+    fn reload_live_logs(&mut self) {
+        self.live_logs = load_all_voidcore_logs(300);
     }
 
     fn refresh_daemon_status(&mut self) {
@@ -235,6 +274,12 @@ impl eframe::App for VoidCoreApp {
             self.refresh_daemon_status();
             self.last_status_refresh = now;
             ctx.request_repaint_after(std::time::Duration::from_secs(5));
+        }
+
+        if self.selected_tab == Tab::Overview && now - self.last_live_log_refresh > 2.0 {
+            self.reload_live_logs();
+            self.last_live_log_refresh = now;
+            ctx.request_repaint_after(std::time::Duration::from_secs(2));
         }
 
         egui::TopBottomPanel::top("top_panel")
@@ -282,6 +327,10 @@ impl eframe::App for VoidCoreApp {
                         if tab == Tab::Logs {
                             self.reload_logs();
                         }
+                        if tab == Tab::Overview {
+                            self.reload_live_logs();
+                            self.last_live_log_refresh = ctx.input(|i| i.time);
+                        }
                     }
                     ui.add_space(4.0);
                 }
@@ -326,6 +375,7 @@ impl VoidCoreApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui::secondary_button(ui, p, "Refresh").clicked() {
                     self.refresh_daemon_status();
+                    self.reload_live_logs();
                 }
             });
         });
@@ -418,6 +468,93 @@ impl VoidCoreApp {
                     },
                 ));
             });
+        });
+
+        ui.add_space(16.0);
+        self.show_live_log_panel(ui, p);
+    }
+
+    fn show_live_log_panel(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        card_frame(p).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(section_title("Live Activity Log"));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if !self.live_logs_follow {
+                        if ui::secondary_button(ui, p, "Follow latest").clicked() {
+                            self.live_logs_follow = true;
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Live · 2s refresh")
+                                .size(11.0)
+                                .color(p.success),
+                        );
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            ui.label(theme::muted_text(
+                "Merged stream from core, enforce, vision, ipc, and other VoidCore logs.",
+            ));
+            ui.add_space(10.0);
+
+            if self.live_logs.is_empty() {
+                ui::empty_state(
+                    ui,
+                    p,
+                    "No log activity yet",
+                    "Events will appear here as the daemon writes to C:\\ProgramData\\VoidCore\\logs.",
+                );
+                return;
+            }
+
+            let scroll = egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .stick_to_bottom(self.live_logs_follow)
+                .max_height(240.0)
+                .show(ui, |ui| {
+                    for log in &self.live_logs {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new(&log.time)
+                                    .size(12.0)
+                                    .color(p.text_muted)
+                                    .family(egui::FontFamily::Monospace),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("[{}]", log.source))
+                                    .size(12.0)
+                                    .color(p.accent)
+                                    .family(egui::FontFamily::Monospace),
+                            );
+                            let level_color = match log.action.as_str() {
+                                "ERROR" | "BLOCK" | "IPC_AUTH_FAIL" => p.danger,
+                                "WARN" => p.warning,
+                                "ALLOW" | "INFO" => p.success,
+                                _ => p.text_secondary,
+                            };
+                            ui.label(
+                                egui::RichText::new(format!("[{}]", log.action))
+                                    .size(12.0)
+                                    .color(level_color)
+                                    .family(egui::FontFamily::Monospace),
+                            );
+                            ui.label(
+                                egui::RichText::new(&log.message)
+                                    .size(12.0)
+                                    .color(p.text_primary),
+                            );
+                        });
+                        ui.add_space(2.0);
+                    }
+                });
+
+            let viewport_h = scroll.inner_rect.height();
+            let max_offset = (scroll.content_size.y - viewport_h).max(0.0);
+            if scroll.state.offset.y < max_offset - 2.0 {
+                self.live_logs_follow = false;
+            }
         });
     }
 
@@ -603,7 +740,7 @@ impl VoidCoreApp {
                                         "ALLOW" => p.success,
                                         _ => p.text_secondary,
                                     };
-                                    let source_color = match log.source {
+                                    let source_color = match log.source.as_str() {
                                         "vision" => p.accent,
                                         _ => p.text_muted,
                                     };
@@ -615,7 +752,7 @@ impl VoidCoreApp {
                                             .family(egui::FontFamily::Monospace),
                                     );
                                     ui.label(
-                                        egui::RichText::new(log.source)
+                                        egui::RichText::new(&log.source)
                                             .size(13.0)
                                             .color(source_color),
                                     );
