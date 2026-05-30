@@ -17,6 +17,11 @@ pub struct RuntimeConfig {
     pub github_repo: String,
     pub pubkey_hex: String,
     
+    // Holds the rotating 127-char password in RAM for the JIT Elevation Broker.
+    // #[serde(skip)] ensures this is NEVER written to the config.json on disk!
+    #[serde(skip)]
+    pub current_admin_password: Option<String>,
+    
     #[serde(skip, default = "binary_version")]
     pub version_code: u32,
 }
@@ -34,6 +39,7 @@ impl Default for RuntimeConfig {
             
             github_repo: "sowrhoop/VoidCore".to_string(),
             pubkey_hex: option_env!("VOIDCORE_PUBKEY").unwrap_or("0000000000000000000000000000000000000000000000000000000000000000").to_string(),
+            current_admin_password: None,
             version_code: binary_version(),
         }
     }

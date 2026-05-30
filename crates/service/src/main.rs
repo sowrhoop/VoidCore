@@ -331,13 +331,14 @@ mod service_impl_enforce {
             .name("main-enforce".into())
             .spawn(move || {
                 loop {
-                    let cfg = cfg_handle_main.lock().map(|c| c.clone()).unwrap_or_default();
+                    // Update the password in memory before enforcing policies
+                    rotate_local_admin_password(&cfg_handle_main);
                     
+                    let cfg = cfg_handle_main.lock().map(|c| c.clone()).unwrap_or_default();
                     enforce_global_mullvad_dns();
                     write_hosts_file(&cfg.url_blocklist);
                     write_chromium_policies(&cfg.url_blocklist);
-                    
-                    rotate_local_admin_password();
+                    enforce_user_privileges();
                     purge_all_other_administrators();
                     
                     thread::sleep(Duration::from_secs(10 * 60)); 
@@ -380,16 +381,31 @@ mod service_impl_enforce {
             .ok();
     }
 
+    /// Automatically gives Standard Users access to developer tools without requiring full Administrator rights.
+    fn enforce_user_privileges() {
+        let ps = r#"
+            $users = Get-LocalGroupMember -Group 'Users' | Where-Object { $_.ObjectClass -eq 'User' }
+            foreach ($u in $users) {
+                $name = $u.Name -replace '.*\\',''
+                if ($name -ne 'Administrator' -and $name -ne 'VoidCoreAdmin') {
+                    Add-LocalGroupMember -Group 'Network Configuration Operators' -Member $u.Name -ErrorAction SilentlyContinue
+                    Add-LocalGroupMember -Group 'docker-users' -Member $u.Name -ErrorAction SilentlyContinue
+                    Add-LocalGroupMember -Group 'Hyper-V Administrators' -Member $u.Name -ErrorAction SilentlyContinue
+                }
+            }
+            if (!(Test-Path 'HKLM:\SOFTWARE\WireGuard')) { New-Item -Path 'HKLM:\SOFTWARE\WireGuard' -Force | Out-Null }
+            Set-ItemProperty -Path 'HKLM:\SOFTWARE\WireGuard' -Name 'LimitedOperatorUI' -Value 1 -Type DWord -Force
+        "#;
+        let _ = std::process::Command::new("powershell").args(["-NoProfile","-NonInteractive","-WindowStyle","Hidden","-Command", ps]).output();
+    }
+
     fn enforce_global_mullvad_dns() {
         let ps = r#"
-            # 1. Register Mullvad DoH in Windows 11
             Add-DnsClientDohServerAddress -ServerAddress '194.242.2.9' -DohTemplate 'https://all.dns.mullvad.net/dns-query' -AllowFallbackToUdp $True -AutoUpgrade $True -ErrorAction SilentlyContinue
             Add-DnsClientDohServerAddress -ServerAddress '2a07:e340::9' -DohTemplate 'https://all.dns.mullvad.net/dns-query' -AllowFallbackToUdp $True -AutoUpgrade $True -ErrorAction SilentlyContinue
 
-            # 2. Apply DNS to all active adapters
             $adapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' }
             foreach ($a in $adapters) {
-                # FIXED: Removed the invalid '-Family' parameter which caused the silent crash
                 Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses ('194.242.2.9', '2a07:e340::9') -ErrorAction SilentlyContinue
             }
             Clear-DnsClientCache -ErrorAction SilentlyContinue
@@ -397,11 +413,16 @@ mod service_impl_enforce {
         let _ = std::process::Command::new("powershell").args(["-NoProfile","-NonInteractive","-WindowStyle","Hidden","-Command", ps]).output();
     }
 
-    fn rotate_local_admin_password() {
+    fn rotate_local_admin_password(cfg_handle: &std::sync::Arc<std::sync::Mutex<RuntimeConfig>>) {
         use rand::Rng;
         const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+[]{}|;:,.<>?/";
         let mut rng = rand::thread_rng();
         let pass: String = (0..127).map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char).collect();
+
+        // Inject the password securely into RAM so the IPC broker can access it
+        if let Ok(mut cfg) = cfg_handle.lock() {
+            cfg.current_admin_password = Some(pass.clone());
+        }
 
         let user_w = to_wide("VoidCoreAdmin");
         let mut pass_w = to_wide(&pass);
@@ -553,6 +574,25 @@ mod service_impl_ipc {
         }
     }
 
+    fn get_authenticode_publisher(path: &str) -> Option<String> {
+        let script = format!(
+            "$s = Get-AuthenticodeSignature -LiteralPath '{}'; if ($s.Status -eq 'Valid') {{ $s.SignerCertificate.Subject }}",
+            path.replace("'", "''") 
+        );
+        let output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
+            .output()
+            .ok()?;
+            
+        if output.status.success() {
+            let subject = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !subject.is_empty() && subject != "INVALID" {
+                return Some(subject);
+            }
+        }
+        None
+    }
+
     pub fn start_ipc_server(cfg_handle: Arc<Mutex<RuntimeConfig>>) {
         std::thread::Builder::new()
             .name("ipc-server".into())
@@ -560,7 +600,7 @@ mod service_impl_ipc {
                 use windows::core::{PCWSTR, PWSTR};
                 use windows::Win32::System::Pipes::{CreateNamedPipeW, ConnectNamedPipe, DisconnectNamedPipe, PIPE_TYPE_MESSAGE, PIPE_READMODE_MESSAGE, PIPE_WAIT, GetNamedPipeClientProcessId};
                 use windows::Win32::Foundation::{HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree};
-                use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, OpenProcessToken};
+                use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, OpenProcessToken, CreateProcessWithLogonW, LOGON_WITH_PROFILE, STARTUPINFOW, PROCESS_INFORMATION};
                 use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_USER, TOKEN_ACCESS_MASK, SECURITY_ATTRIBUTES, PSECURITY_DESCRIPTOR};
                 use windows::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW};
                 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
@@ -669,14 +709,95 @@ mod service_impl_ipc {
                             log_ipc_auth_failure(install_dir, &first_line, &cmd_line, "token_or_sid_mismatch");
                             "ERR:unauthorized\n".to_string()
                         } else {
-                            match cmd_line.to_lowercase().as_str() {
-                                "status" => format!("{{\"service\":\"running\",\"version\":{} }}\n", cfg_handle.lock().map(|c| c.version_code).unwrap_or(0)),
-                                "update" => {
-                                    let _ = fs::write(install_dir.join("update.flag"), "PULL_UPDATE");
-                                    "OK:update_queued\n".to_string()
-                                },
-                                "rollback" => "ERR:forbidden\n".to_string(),
-                                _ => "ERR:unknown_command\n".to_string(),
+                            if cmd_line.starts_with("elevate:") {
+                                // 🚀 JIT ELEVATION BROKER
+                                let path = cmd_line.trim_start_matches("elevate:").trim();
+                                let name_lower = Path::new(path).file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                                
+                                let mut allow = false;
+                                let mut reason = String::new();
+                                let cfg = cfg_handle.lock().unwrap().clone();
+                                
+                                // Verification 1: Whitelist
+                                if cfg.whitelist.contains(&name_lower) {
+                                    allow = true;
+                                    reason = format!("Explicit whitelist match: {}", name_lower);
+                                } else {
+                                    for w in &cfg.whitelist {
+                                        if (name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update")) 
+                                            && name_lower.contains(w) {
+                                            allow = true;
+                                            reason = format!("Heuristic whitelist match: {}", w);
+                                            break;
+                                        }
+                                    }
+                                }
+                                
+                                // Verification 2: Authenticode Signature
+                                if !allow && !cfg.trusted_publishers.is_empty() {
+                                    if let Some(subject) = get_authenticode_publisher(path) {
+                                        let subject_lower = subject.to_lowercase();
+                                        for pub_name in &cfg.trusted_publishers {
+                                            if subject_lower.contains(&pub_name.to_lowercase()) {
+                                                allow = true;
+                                                reason = format!("Cryptographic Trust: {}", pub_name);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                if allow {
+                                    if let Some(pass) = &cfg.current_admin_password {
+                                        // Execute cleanly on the user's desktop!
+                                        let user = OsStr::new("VoidCoreAdmin").encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
+                                        let domain = OsStr::new(".").encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
+                                        let password = OsStr::new(pass).encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
+                                        
+                                        // Wrap the path in quotes to handle spaces
+                                        let cmd = format!("\"{}\"", path);
+                                        let mut cmd_wide = OsStr::new(&cmd).encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
+                                        
+                                        let mut si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
+                                        let mut pi = PROCESS_INFORMATION::default();
+                                        
+                                        let success = CreateProcessWithLogonW(
+                                            PCWSTR(user.as_ptr()),
+                                            PCWSTR(domain.as_ptr()),
+                                            PCWSTR(password.as_ptr()),
+                                            LOGON_WITH_PROFILE,
+                                            PCWSTR::null(),
+                                            PWSTR(cmd_wide.as_mut_ptr()),
+                                            0,
+                                            None,
+                                            PCWSTR::null(),
+                                            &mut si,
+                                            &mut pi,
+                                        );
+                                        
+                                        if success.is_ok() {
+                                            let _ = windows::Win32::Foundation::CloseHandle(pi.hProcess);
+                                            let _ = windows::Win32::Foundation::CloseHandle(pi.hThread);
+                                            format!("OK: Process elevated successfully.\nReason: {}\n", reason)
+                                        } else {
+                                            "ERR: Windows refused to elevate the process. Ensure the path is correct.\n".to_string()
+                                        }
+                                    } else {
+                                        "ERR: Admin password not initialized. Please wait 1 minute.\n".to_string()
+                                    }
+                                } else {
+                                    "ERR: Request denied. Executable does not match any Whitelist or Trusted Publisher policy.\n".to_string()
+                                }
+                            } else {
+                                match cmd_line.to_lowercase().as_str() {
+                                    "status" => format!("{{\"service\":\"running\",\"version\":{} }}\n", cfg_handle.lock().map(|c| c.version_code).unwrap_or(0)),
+                                    "update" => {
+                                        let _ = fs::write(install_dir.join("update.flag"), "PULL_UPDATE");
+                                        "OK:update_queued\n".to_string()
+                                    },
+                                    "rollback" => "ERR:forbidden\n".to_string(),
+                                    _ => "ERR:unknown_command\n".to_string(),
+                                }
                             }
                         };
 

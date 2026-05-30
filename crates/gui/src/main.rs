@@ -41,9 +41,9 @@ fn main() {
         Box::new(|cc| {
             let mut visuals = egui::Visuals::dark();
             visuals.window_rounding = 10.0.into();
-            visuals.panel_fill = egui::Color32::from_rgb(14, 16, 20); // Deep background
-            visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(26, 28, 34); // Elevated cards
-            visuals.selection.bg_fill = egui::Color32::from_rgb(0, 160, 255); // Vivid cyan accent
+            visuals.panel_fill = egui::Color32::from_rgb(14, 16, 20);
+            visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(26, 28, 34);
+            visuals.selection.bg_fill = egui::Color32::from_rgb(0, 160, 255);
             cc.egui_ctx.set_visuals(visuals);
             
             Box::new(VoidCoreApp::new())
@@ -51,12 +51,7 @@ fn main() {
     );
 
     if let Err(e) = result {
-        let err_msg = format!(
-            "The VoidCore graphics engine failed to initialize.\n\n\
-            If you are testing this inside a Virtual Machine, it likely lacks the 3D hardware acceleration required to render the Dashboard.\n\n\
-            Technical Details:\n{}",
-            e
-        );
+        let err_msg = format!("The VoidCore graphics engine failed to initialize.\n\nTechnical Details:\n{}", e);
         show_error_msg(&err_msg);
     }
 }
@@ -72,6 +67,7 @@ struct VoidCoreApp {
     daemon_status: String,
     daemon_version: String,
     update_message: Option<String>,
+    elevate_path: String,
     config: RuntimeConfig,
     logs: Vec<LogEntry>,
 }
@@ -80,6 +76,7 @@ struct VoidCoreApp {
 enum Tab {
     Overview,
     Enforcements,
+    Launchpad,
     Logs,
 }
 
@@ -97,6 +94,7 @@ impl VoidCoreApp {
             daemon_status: status,
             daemon_version: version,
             update_message: None,
+            elevate_path: String::new(),
             config,
             logs: vec![],
         };
@@ -129,6 +127,16 @@ impl VoidCoreApp {
 impl eframe::App for VoidCoreApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         
+        // Handle Drag-and-Drop globally
+        if !ctx.input(|i| i.raw.dropped_files.is_empty()) {
+            if let Some(file) = ctx.input(|i| i.raw.dropped_files.first().cloned()) {
+                if let Some(path) = file.path {
+                    self.elevate_path = path.to_string_lossy().to_string();
+                    self.selected_tab = Tab::Launchpad;
+                }
+            }
+        }
+
         // TOP HEADER
         egui::TopBottomPanel::top("top_panel").frame(
             egui::Frame::none().fill(egui::Color32::from_rgb(20, 22, 28)).inner_margin(12.0)
@@ -159,6 +167,7 @@ impl eframe::App for VoidCoreApp {
             
             ui.selectable_value(&mut self.selected_tab, Tab::Overview, egui::RichText::new("📊 Overview").size(16.0));
             ui.selectable_value(&mut self.selected_tab, Tab::Enforcements, egui::RichText::new("🔒 Policies").size(16.0));
+            ui.selectable_value(&mut self.selected_tab, Tab::Launchpad, egui::RichText::new("🚀 Launchpad").size(16.0));
             
             if ui.selectable_value(&mut self.selected_tab, Tab::Logs, egui::RichText::new("📝 Audit Logs").size(16.0)).clicked() {
                 self.reload_logs();
@@ -215,16 +224,13 @@ impl eframe::App for VoidCoreApp {
                     ui.add_space(20.0);
                     
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        let policy_frame = egui::Frame::none()
-                            .fill(egui::Color32::from_rgb(26, 28, 34))
-                            .rounding(8.0)
-                            .inner_margin(16.0);
+                        let policy_frame = egui::Frame::none().fill(egui::Color32::from_rgb(26, 28, 34)).rounding(8.0).inner_margin(16.0);
 
                         policy_frame.show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.label(egui::RichText::new("🌐 Network Layer").strong().size(16.0).color(egui::Color32::from_rgb(0, 180, 255)));
                             ui.add_space(8.0);
-                            ui.label("✔ OS DNS locked to Mullvad Ad/Tracker/Malware filter (194.242.2.9).");
+                            ui.label("✔ OS DNS locked to Mullvad Ad/Tracker/Malware filter.");
                             ui.label("✔ Chromium DNS-over-HTTPS cryptographically forced.");
                             ui.label(format!("✔ Firewall Outbound Drops dynamically active for {} domains.", self.config.url_blocklist.len()));
                         });
@@ -250,6 +256,33 @@ impl eframe::App for VoidCoreApp {
                         });
                     });
                 },
+                Tab::Launchpad => {
+                    ui.heading(egui::RichText::new("Secure Elevation Broker").size(24.0).strong().color(egui::Color32::WHITE));
+                    ui.add_space(20.0);
+                    
+                    ui.label(egui::RichText::new(
+                        "Some whitelisted applications (like installers or flashing tools) require Administrator privileges to run. \
+                        Because your account is locked down, Windows UAC will normally block them.\n\n\
+                        Paste the path to the executable below. If it is from a Trusted Publisher, the VoidCore daemon will dynamically generate a privileged \
+                        environment and launch the application directly on your desktop."
+                    ).size(14.0).color(egui::Color32::LIGHT_GRAY));
+                    
+                    ui.add_space(30.0);
+                    
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Executable Path:").strong().size(14.0));
+                        ui.add(egui::TextEdit::singleline(&mut self.elevate_path).desired_width(450.0).margin(egui::vec2(8.0, 8.0)));
+                    });
+                    
+                    ui.add_space(20.0);
+                    
+                    if ui.button(egui::RichText::new("⚡ Launch Elevated").size(16.0)).clicked() {
+                        self.update_message = Some(send_elevate_command(&self.elevate_path));
+                    }
+                    
+                    ui.add_space(40.0);
+                    ui.label(egui::RichText::new("💡 Tip: You can drag and drop an .exe file anywhere onto this window to auto-fill the path.").italics().color(egui::Color32::from_rgb(100, 150, 200)));
+                },
                 Tab::Logs => {
                     ui.horizontal(|ui| {
                         ui.heading(egui::RichText::new("Execution Audit Logs").size(24.0).strong().color(egui::Color32::WHITE));
@@ -261,41 +294,33 @@ impl eframe::App for VoidCoreApp {
                     });
                     ui.add_space(20.0);
                     
-                    let table_frame = egui::Frame::none()
-                        .fill(egui::Color32::from_rgb(22, 24, 28))
-                        .rounding(6.0)
-                        .inner_margin(8.0);
-
+                    let table_frame = egui::Frame::none().fill(egui::Color32::from_rgb(22, 24, 28)).rounding(6.0).inner_margin(8.0);
                     table_frame.show(ui, |ui| {
                         egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-                            egui::Grid::new("logs_grid")
-                                .striped(true)
-                                .min_col_width(140.0)
-                                .spacing([20.0, 8.0])
-                                .show(ui, |ui| {
-                                    ui.label(egui::RichText::new("Timestamp").strong().color(egui::Color32::LIGHT_GRAY));
-                                    ui.label(egui::RichText::new("Action").strong().color(egui::Color32::LIGHT_GRAY));
-                                    ui.label(egui::RichText::new("Details").strong().color(egui::Color32::LIGHT_GRAY));
+                            egui::Grid::new("logs_grid").striped(true).min_col_width(140.0).spacing([20.0, 8.0]).show(ui, |ui| {
+                                ui.label(egui::RichText::new("Timestamp").strong().color(egui::Color32::LIGHT_GRAY));
+                                ui.label(egui::RichText::new("Action").strong().color(egui::Color32::LIGHT_GRAY));
+                                ui.label(egui::RichText::new("Details").strong().color(egui::Color32::LIGHT_GRAY));
+                                ui.end_row();
+
+                                if self.logs.is_empty() {
+                                    ui.label(egui::RichText::new("No entries.").italics());
                                     ui.end_row();
+                                }
 
-                                    if self.logs.is_empty() {
-                                        ui.label(egui::RichText::new("No entries.").italics());
-                                        ui.end_row();
-                                    }
+                                for log in &self.logs {
+                                    let action_color = match log.action.as_str() {
+                                        "BLOCK" => egui::Color32::from_rgb(255, 80, 80),
+                                        "ALLOW" => egui::Color32::from_rgb(80, 255, 120),
+                                        _ => egui::Color32::LIGHT_GRAY,
+                                    };
 
-                                    for log in &self.logs {
-                                        let action_color = match log.action.as_str() {
-                                            "BLOCK" => egui::Color32::from_rgb(255, 80, 80),
-                                            "ALLOW" => egui::Color32::from_rgb(80, 255, 120),
-                                            _ => egui::Color32::LIGHT_GRAY,
-                                        };
-
-                                        ui.label(egui::RichText::new(&log.time).size(13.0).color(egui::Color32::GRAY));
-                                        ui.label(egui::RichText::new(&log.action).strong().size(13.0).color(action_color));
-                                        ui.label(egui::RichText::new(&log.message).size(13.0).color(egui::Color32::WHITE));
-                                        ui.end_row();
-                                    }
-                                });
+                                    ui.label(egui::RichText::new(&log.time).size(13.0).color(egui::Color32::GRAY));
+                                    ui.label(egui::RichText::new(&log.action).strong().size(13.0).color(action_color));
+                                    ui.label(egui::RichText::new(&log.message).size(13.0).color(egui::Color32::WHITE));
+                                    ui.end_row();
+                                }
+                            });
                         });
                     });
                 }
@@ -375,4 +400,25 @@ fn send_update_command() -> String {
         return "Update requested. System daemon will hot-swap and reboot in ~15 seconds.".to_string();
     }
     "Failed to reach daemon. Are you sure it is running?".to_string()
+}
+
+fn send_elevate_command(path: &str) -> String {
+    if path.trim().is_empty() { return "Please provide a valid executable path.".to_string(); }
+    if let Ok(mut file) = connect_to_daemon() {
+        if let Ok(token) = std::fs::read_to_string(r"C:\ProgramData\VoidCore\gui.token") {
+            let _ = file.write_all(format!("TOKEN:{}\n", token.trim()).as_bytes());
+        } else {
+            let _ = file.write_all(b"\n");
+        }
+        
+        let _ = file.write_all(format!("elevate:{}\n", path).as_bytes());
+        let _ = file.flush();
+        
+        let mut reader = BufReader::new(file);
+        let mut resp = String::new();
+        if reader.read_line(&mut resp).is_ok() {
+            return resp.trim().to_string();
+        }
+    }
+    "Failed to securely communicate with the background daemon.".to_string()
 }
