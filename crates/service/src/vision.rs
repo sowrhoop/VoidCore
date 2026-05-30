@@ -16,6 +16,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const MODEL_DIR: &str = r"C:\ProgramData\VoidCore\models";
+const SNAPSHOT_DIR: &str = r"C:\ProgramData\VoidCore\vision-tmp";
+const INSTALL_DIR: &str = r"C:\ProgramData\VoidCore";
 const MODEL_FILE: &str = "nsfw_mobilenet2_224.onnx";
 const MODEL_URL: &str =
     "https://raw.githubusercontent.com/Kazuhito00/nsfw_model_onnx_sample/main/model/nsfw_mobilenet2_224.onnx";
@@ -42,13 +44,34 @@ pub fn try_run_snapshot_cli() -> bool {
         return false;
     };
 
+    if let Some(parent) = Path::new(&out_path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
     match capture_desktop_direct() {
         Ok(Some(img)) => {
-            let code = if img.save(&out_path).is_ok() { 0 } else { 1 };
-            std::process::exit(code);
+            if let Err(e) = img.save(&out_path) {
+                let _ = super::logging::log_event(
+                    "vision",
+                    "WARN",
+                    &format!("snapshot save failed ({out_path}): {e}"),
+                );
+                std::process::exit(1);
+            }
+            std::process::exit(0);
         }
-        Ok(None) => std::process::exit(2),
-        Err(_) => std::process::exit(1),
+        Ok(None) => {
+            let _ = super::logging::log_event("vision", "WARN", "snapshot capture returned empty");
+            std::process::exit(2);
+        }
+        Err(e) => {
+            let _ = super::logging::log_event(
+                "vision",
+                "WARN",
+                &format!("snapshot capture failed: {e}"),
+            );
+            std::process::exit(1);
+        }
     }
 }
 
@@ -261,16 +284,49 @@ fn is_desktop_access_error(err: &str) -> bool {
         || err.contains("SetThreadDesktop")
         || err.contains("OpenWindowStation")
         || err.contains("SetProcessWindowStation")
+        || err.contains("Access is denied")
+}
+
+fn running_in_session_zero() -> bool {
+    unsafe {
+        use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+        use windows::Win32::System::Threading::GetCurrentProcessId;
+
+        let mut session_id = 0u32;
+        if ProcessIdToSessionId(GetCurrentProcessId(), &mut session_id).is_err() {
+            return false;
+        }
+        session_id == 0
+    }
+}
+
+fn log_helper_mode_once() {
+    if !HELPER_MODE_LOGGED.swap(true, Ordering::Relaxed) {
+        let _ = super::logging::log_event(
+            "vision",
+            "INFO",
+            "Screen capture using user-session helper (Session 0 service)",
+        );
+    }
 }
 
 fn capture_active_desktop() -> Result<Option<RgbaImage>, String> {
+    // Services run in Session 0 — inline GDI capture cannot reach the interactive desktop.
+    if running_in_session_zero() {
+        let result = capture_via_user_session_helper()?;
+        if result.is_some() {
+            log_helper_mode_once();
+        }
+        return Ok(result);
+    }
+
     let guard = match ActiveUserGuard::new() {
         Ok(g) => g,
         Err(_) => return Ok(None),
     };
 
     let inline = (|| {
-        ensure_interactive_window_station()?;
+        try_interactive_window_station();
         capture_input_desktop()
     })();
 
@@ -280,12 +336,8 @@ fn capture_active_desktop() -> Result<Option<RgbaImage>, String> {
             drop(guard);
             match capture_via_user_session_helper() {
                 Ok(img) => {
-                    if !HELPER_MODE_LOGGED.swap(true, Ordering::Relaxed) {
-                        let _ = super::logging::log_event(
-                            "vision",
-                            "INFO",
-                            "Screen capture using user-session helper (Session 0 service)",
-                        );
+                    if img.is_some() {
+                        log_helper_mode_once();
                     }
                     Ok(img)
                 }
@@ -297,7 +349,11 @@ fn capture_active_desktop() -> Result<Option<RgbaImage>, String> {
 }
 
 fn capture_desktop_direct() -> Result<Option<RgbaImage>, String> {
-    bitblt_screen()
+    match capture_input_desktop() {
+        Ok(Some(img)) => Ok(Some(img)),
+        Ok(None) => bitblt_screen(),
+        Err(_) => bitblt_screen(),
+    }
 }
 
 fn lock_active_session() -> Result<(), String> {
@@ -370,6 +426,14 @@ impl Drop for ActiveUserGuard {
     }
 }
 
+fn try_interactive_window_station() {
+    static TRIED: AtomicBool = AtomicBool::new(false);
+    if TRIED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let _ = ensure_interactive_window_station();
+}
+
 fn ensure_interactive_window_station() -> Result<(), String> {
     static WINSTA: OnceLock<Result<(), String>> = OnceLock::new();
     WINSTA
@@ -402,16 +466,36 @@ fn ensure_interactive_window_station() -> Result<(), String> {
         .clone()
 }
 
+fn grant_users_snapshot_access() {
+    use std::os::windows::process::CommandExt;
+
+    static GRANTED: AtomicBool = AtomicBool::new(false);
+    if GRANTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let _ = std::process::Command::new("icacls")
+        .args([SNAPSHOT_DIR, "/grant", "*S-1-5-32-545:(OI)(CI)M"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+}
+
+fn prepare_snapshot_path() -> Result<std::path::PathBuf, String> {
+    std::fs::create_dir_all(SNAPSHOT_DIR).map_err(|e| e.to_string())?;
+    grant_users_snapshot_access();
+    let path = Path::new(SNAPSHOT_DIR).join(format!("snap-{}.png", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    Ok(path)
+}
+
 fn capture_via_user_session_helper() -> Result<Option<RgbaImage>, String> {
     let session = unsafe { windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId() };
     if session == 0xFFFF_FFFF {
         return Ok(None);
     }
 
-    let snapshot_path = std::env::temp_dir().join(format!(
-        "voidcore-vision-{}.png",
-        std::process::id()
-    ));
+    let snapshot_path = prepare_snapshot_path()?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let cmd = format!(
         "\"{}\" --vision-snapshot \"{}\"",
@@ -422,9 +506,6 @@ fn capture_via_user_session_helper() -> Result<Option<RgbaImage>, String> {
     unsafe {
         use windows::core::{PCWSTR, PWSTR};
         use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
-        use windows::Win32::Security::{
-            DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS,
-        };
         use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
         use windows::Win32::System::RemoteDesktop::WTSQueryUserToken;
         use windows::Win32::System::Threading::{
@@ -436,26 +517,16 @@ fn capture_via_user_session_helper() -> Result<Option<RgbaImage>, String> {
         WTSQueryUserToken(session, &mut user_token)
             .map_err(|e| format!("WTSQueryUserToken: {e}"))?;
 
-        let mut primary = HANDLE::default();
-        DuplicateTokenEx(
-            user_token,
-            TOKEN_ALL_ACCESS,
-            None,
-            SecurityImpersonation,
-            TokenPrimary,
-            &mut primary,
-        )
-        .map_err(|e| {
-            let _ = CloseHandle(user_token);
-            format!("DuplicateTokenEx: {e}")
-        })?;
-        let _ = CloseHandle(user_token);
-
         let mut env_block = std::ptr::null_mut();
-        let _ = CreateEnvironmentBlock(&mut env_block, primary, false);
+        if CreateEnvironmentBlock(&mut env_block, user_token, false).is_err() {
+            let _ = CloseHandle(user_token);
+            return Err("CreateEnvironmentBlock failed".into());
+        }
 
+        let mut exe_wide = to_wide(&exe.to_string_lossy());
         let mut cmd_wide = to_wide(&cmd);
         let mut desktop_wide = to_wide("winsta0\\default");
+        let mut workdir_wide = to_wide(INSTALL_DIR);
 
         let mut si = STARTUPINFOW {
             cb: std::mem::size_of::<STARTUPINFOW>() as u32,
@@ -465,19 +536,15 @@ fn capture_via_user_session_helper() -> Result<Option<RgbaImage>, String> {
         let mut pi = PROCESS_INFORMATION::default();
 
         let create_result = CreateProcessAsUserW(
-            primary,
-            PCWSTR::null(),
+            user_token,
+            PCWSTR(exe_wide.as_mut_ptr()),
             PWSTR(cmd_wide.as_mut_ptr()),
             None,
             None,
             false,
             CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-            if env_block.is_null() {
-                None
-            } else {
-                Some(env_block as *const _)
-            },
-            PCWSTR::null(),
+            Some(env_block as *const _),
+            PCWSTR(workdir_wide.as_mut_ptr()),
             &mut si,
             &mut pi,
         );
@@ -485,7 +552,7 @@ fn capture_via_user_session_helper() -> Result<Option<RgbaImage>, String> {
         if !env_block.is_null() {
             let _ = DestroyEnvironmentBlock(env_block);
         }
-        let _ = CloseHandle(primary);
+        let _ = CloseHandle(user_token);
 
         create_result.map_err(|e| format!("CreateProcessAsUserW: {e}"))?;
 
@@ -497,12 +564,18 @@ fn capture_via_user_session_helper() -> Result<Option<RgbaImage>, String> {
 
         if wait != WAIT_OBJECT_0 || exit_code != 0 {
             let _ = std::fs::remove_file(&snapshot_path);
-            return Err(format!("snapshot helper exit={exit_code}"));
+            return Err(format!(
+                "snapshot helper exit={exit_code} path={}",
+                snapshot_path.display()
+            ));
         }
     }
 
     if !snapshot_path.exists() {
-        return Err("snapshot file missing".into());
+        return Err(format!(
+            "snapshot file missing at {}",
+            snapshot_path.display()
+        ));
     }
 
     let img = image::open(&snapshot_path)
