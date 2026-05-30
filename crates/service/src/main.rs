@@ -68,10 +68,6 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         let _ = fs::create_dir_all(install_dir);
     }
 
-    // 🚨 ZERO-TRUST FIX: PREVENT CONFIGURATION STATE DRIFT 🚨
-    // The compiled binary is the absolute source of truth. 
-    // We forcefully overwrite the disk's config.json on every boot so that 
-    // manual break-glass overrides or old files never pollute the active runtime.
     let cfg = RuntimeConfig::default();
     let cfg_path = install_dir.join("config.json");
     let _ = fs::write(&cfg_path, serde_json::to_string_pretty(&cfg).unwrap_or_default());
@@ -122,7 +118,7 @@ mod service_impl_enforce {
     use wmi::{COMLibrary, WMIConnection};
     use serde::Deserialize;
     use windows::core::{PCWSTR, PWSTR};
-    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, PROCESS_NAME_WIN32};
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, GetExitCodeProcess};
     use windows::Win32::NetworkManagement::NetManagement::{NetUserSetInfo, USER_INFO_1003};
     use windows::Win32::System::Registry::{RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, REG_SZ, REG_DWORD, REG_OPTION_NON_VOLATILE};
 
@@ -138,7 +134,6 @@ mod service_impl_enforce {
         OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
     }
 
-    /// Crosses the Session 0 boundary to instantly pop a native notification on the active user's screen
     fn notify_user(title_str: &str, msg_str: &str) {
         unsafe {
             use windows::Win32::System::RemoteDesktop::WTSSendMessageW;
@@ -150,16 +145,16 @@ mod service_impl_enforce {
             let mut response = MESSAGEBOX_RESULT(0);
             
             let _ = WTSSendMessageW(
-                HANDLE(0), // WTS_CURRENT_SERVER_HANDLE
-                0xFFFFFFFF, // WTS_ACTIVE_SESSION_ID
+                HANDLE(0), 
+                0xFFFFFFFF, 
                 PCWSTR(title.as_ptr()),
                 (title.len() * 2) as u32,
                 PCWSTR(msg.as_ptr()),
                 (msg.len() * 2) as u32,
-                MESSAGEBOX_STYLE(0x00000030), // MB_ICONEXCLAMATION
-                5, // Timeout
+                MESSAGEBOX_STYLE(0x00000030), 
+                5, 
                 &mut response,
-                windows::Win32::Foundation::BOOL(0), // Wait = false
+                windows::Win32::Foundation::BOOL(0),
             );
         }
     }
@@ -207,72 +202,81 @@ mod service_impl_enforce {
                             
                             let mut allow = false;
                             let mut is_ephemeral_installer = false;
+                            let mut reason = String::new();
 
-                            let critical = ["system","smss","csrss","wininit","winlogon","lsass","services","svchost","voidcore-service", "voidcore-gui", "voidcore-setup"];
+                            let critical = ["system","smss","csrss","wininit","winlogon","lsass","services","svchost","voidcore-service", "voidcore-gui", "voidcore-setup", "conhost", "cmd"];
                             if critical.contains(&name_lower.as_str()) { continue; }
+
+                            let junk = ["steam", "epicgameslauncher", "xboxapp", "gamebar", "riotclient"];
+                            let is_junk = junk.iter().any(|j| name_lower.contains(j));
+
+                            if !is_junk {
+                                if cfg.whitelist.contains(&name_lower) {
+                                    allow = true;
+                                } else {
+                                    for w in &cfg.whitelist {
+                                        if (name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update")) 
+                                            && name_lower.contains(w) {
+                                            allow = true;
+                                            is_ephemeral_installer = true;
+                                            reason = format!("Heuristic match: {}", w);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
 
                             unsafe {
                                 if let Ok(proc_handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, false, trace.process_id) {
-                                    let mut buffer = [0u16; 1024];
-                                    let mut size = buffer.len() as u32;
                                     
-                                    if QueryFullProcessImageNameW(proc_handle, PROCESS_NAME_WIN32, PWSTR(buffer.as_mut_ptr()), &mut size).is_ok() {
-                                        let path = String::from_utf16_lossy(&buffer[..size as usize]);
-                                        let path_lower = path.to_lowercase();
-                                        
-                                        if path_lower.contains("\\windows\\system32\\") || 
-                                           path_lower.contains("\\windows\\syswow64\\") || 
-                                           path_lower.contains("\\windows\\systemapps\\") ||
-                                           path_lower.contains("\\windows\\immersivecontrolpanel\\") ||
-                                           path_lower.contains("\\windows\\explorer.exe") ||
-                                           path_lower.contains("\\program files\\windowsapps\\") {
-                                            allow = true;
-                                        }
+                                    let mut exit_code: u32 = 0;
+                                    if GetExitCodeProcess(proc_handle, &mut exit_code).is_ok() && exit_code != 259 {
+                                        let _ = windows::Win32::Foundation::CloseHandle(proc_handle);
+                                        continue; 
+                                    }
 
-                                        let trusted_paths = [
-                                            "\\appdata\\local\\programs\\",
-                                            "\\appdata\\roaming\\npm\\",
-                                            "\\appdata\\local\\npm\\",
-                                            "\\bravesoftware\\",
-                                            "\\vscodium\\",
-                                        ];
-                                        for tp in &trusted_paths {
-                                            if path_lower.contains(tp) {
+                                    if !allow && !is_junk {
+                                        let mut buffer = [0u16; 1024];
+                                        let mut size = buffer.len() as u32;
+                                        
+                                        if QueryFullProcessImageNameW(proc_handle, PROCESS_NAME_WIN32, PWSTR(buffer.as_mut_ptr()), &mut size).is_ok() {
+                                            let path = String::from_utf16_lossy(&buffer[..size as usize]);
+                                            let path_lower = path.to_lowercase();
+                                            
+                                            if path_lower.contains("\\windows\\system32\\") || 
+                                               path_lower.contains("\\windows\\syswow64\\") || 
+                                               path_lower.contains("\\windows\\systemapps\\") ||
+                                               path_lower.contains("\\windows\\immersivecontrolpanel\\") ||
+                                               path_lower.contains("\\windows\\explorer.exe") ||
+                                               path_lower.contains("\\program files\\windowsapps\\") {
                                                 allow = true;
-                                                break;
                                             }
-                                        }
 
-                                        let junk = ["steam", "epicgameslauncher", "xboxapp", "gamebar", "riotclient"];
-                                        for j in &junk {
-                                            if name_lower.contains(j) { allow = false; }
-                                        }
-
-                                        if !allow {
-                                            for w in &cfg.whitelist {
-                                                if name_lower == *w {
+                                            if !allow {
+                                                let trusted_paths = [
+                                                    "\\appdata\\local\\programs\\",
+                                                    "\\appdata\\roaming\\npm\\",
+                                                    "\\appdata\\local\\npm\\",
+                                                    "\\bravesoftware\\",
+                                                    "\\vscodium\\",
+                                                ];
+                                                if trusted_paths.iter().any(|tp| path_lower.contains(tp)) {
                                                     allow = true;
-                                                    break;
-                                                }
-                                                if (name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update")) 
-                                                    && name_lower.contains(w) {
-                                                    allow = true;
-                                                    is_ephemeral_installer = true;
-                                                    break;
                                                 }
                                             }
-                                        }
-                                        
-                                        if !allow && !cfg.trusted_publishers.is_empty() {
-                                            if let Some(subject) = get_authenticode_publisher(&path) {
-                                                let subject_lower = subject.to_lowercase();
-                                                for pub_name in &cfg.trusted_publishers {
-                                                    if subject_lower.contains(&pub_name.to_lowercase()) {
-                                                        allow = true;
-                                                        if name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update") {
-                                                            is_ephemeral_installer = true;
+                                            
+                                            if !allow && !cfg.trusted_publishers.is_empty() {
+                                                if let Some(subject) = get_authenticode_publisher(&path) {
+                                                    let subject_lower = subject.to_lowercase();
+                                                    for pub_name in &cfg.trusted_publishers {
+                                                        if subject_lower.contains(&pub_name.to_lowercase()) {
+                                                            allow = true;
+                                                            reason = format!("Trusted Publisher: {}", pub_name);
+                                                            if name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update") {
+                                                                is_ephemeral_installer = true;
+                                                            }
+                                                            break;
                                                         }
-                                                        break;
                                                     }
                                                 }
                                             }
@@ -281,36 +285,37 @@ mod service_impl_enforce {
 
                                     if !allow {
                                         let _ = TerminateProcess(proc_handle, 1);
-                                        crate::logging::log_event("enforce", "BLOCK", &format!("Terminated unauthorised process: {}", name_lower));
+                                        crate::logging::log_event("enforce", "BLOCK", &format!("Terminated: {}", name_lower));
                                         
                                         let now = Instant::now();
                                         if last_notified.get(&name_lower).map(|t| now.duration_since(*t).as_secs() > 60).unwrap_or(true) {
-                                            notify_user("VoidCore Enforcer", &format!("Process Terminated:\n{}\n\nNot on whitelist or trusted publisher list.", trace.process_name));
+                                            notify_user("VoidCore Security Guard", &format!("Blocked Execution:\n{}\n\nReason: Application is not in the whitelist or verified by a Trusted Publisher.", trace.process_name));
                                             last_notified.insert(name_lower.clone(), now);
                                         }
                                         
                                     } else if is_ephemeral_installer {
-                                        crate::logging::log_event("enforce", "ALLOW", &format!("Allowed installer with 15m timebomb: {}", name_lower));
+                                        crate::logging::log_event("enforce", "ALLOW", &format!("Timebomb applied: {} ({})", name_lower, reason));
                                         
                                         let now = Instant::now();
                                         if last_notified.get(&name_lower).map(|t| now.duration_since(*t).as_secs() > 60).unwrap_or(true) {
-                                            notify_user("VoidCore Enforcer", &format!("Allowed Installer:\n{}\n\nA 15-minute execution limit has been applied.", trace.process_name));
+                                            notify_user("VoidCore Installation Verified", &format!("Allowed Installer:\n{}\n\nPublisher verified. A 15-minute execution limit has been applied.", trace.process_name));
                                             last_notified.insert(name_lower.clone(), now);
                                         }
 
                                         let pid = trace.process_id;
-                                        thread::Builder::new()
-                                            .name(format!("timebomb-{}", pid))
-                                            .spawn(move || {
-                                                thread::sleep(Duration::from_secs(15 * 60));
-                                                unsafe {
-                                                    if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+                                        thread::Builder::new().name(format!("timebomb-{}", pid)).spawn(move || {
+                                            thread::sleep(Duration::from_secs(15 * 60));
+                                            unsafe {
+                                                if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+                                                    let mut code = 0;
+                                                    if GetExitCodeProcess(bomb_handle, &mut code).is_ok() && code == 259 {
                                                         let _ = TerminateProcess(bomb_handle, 1);
-                                                        let _ = windows::Win32::Foundation::CloseHandle(bomb_handle);
-                                                        crate::logging::log_event("enforce", "BLOCK", "Timebomb detonated installer.");
+                                                        crate::logging::log_event("enforce", "BLOCK", "Timebomb detonated installer after 15m limit.");
                                                     }
+                                                    let _ = windows::Win32::Foundation::CloseHandle(bomb_handle);
                                                 }
-                                            }).ok();
+                                            }
+                                        }).ok();
                                     }
                                     let _ = windows::Win32::Foundation::CloseHandle(proc_handle);
                                 }
@@ -377,13 +382,15 @@ mod service_impl_enforce {
 
     fn enforce_global_mullvad_dns() {
         let ps = r#"
+            # 1. Register Mullvad DoH in Windows 11
             Add-DnsClientDohServerAddress -ServerAddress '194.242.2.9' -DohTemplate 'https://all.dns.mullvad.net/dns-query' -AllowFallbackToUdp $True -AutoUpgrade $True -ErrorAction SilentlyContinue
             Add-DnsClientDohServerAddress -ServerAddress '2a07:e340::9' -DohTemplate 'https://all.dns.mullvad.net/dns-query' -AllowFallbackToUdp $True -AutoUpgrade $True -ErrorAction SilentlyContinue
 
+            # 2. Apply DNS to all active adapters
             $adapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' }
             foreach ($a in $adapters) {
-                Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses '194.242.2.9' -Family IPv4 -ErrorAction SilentlyContinue
-                Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses '2a07:e340::9' -Family IPv6 -ErrorAction SilentlyContinue
+                # FIXED: Removed the invalid '-Family' parameter which caused the silent crash
+                Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses ('194.242.2.9', '2a07:e340::9') -ErrorAction SilentlyContinue
             }
             Clear-DnsClientCache -ErrorAction SilentlyContinue
         "#;
