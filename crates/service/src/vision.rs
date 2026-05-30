@@ -376,14 +376,17 @@ fn ensure_interactive_window_station() -> Result<(), String> {
         .get_or_init(|| unsafe {
             use windows::Win32::Foundation::GetLastError;
             use windows::Win32::System::StationsAndDesktops::{
-                CloseWindowStation, OpenWindowStationW, SetProcessWindowStation, WINSTA_ALL_ACCESS,
+                CloseWindowStation, OpenWindowStationW, SetProcessWindowStation,
             };
+
+            // WINSTA_ALL_ACCESS (0x37F) — not exported as a named constant in windows 0.52.
+            const WINSTA_ALL: u32 = 0x0000_037F;
 
             let mut name = to_wide("WinSta0");
             let winsta = OpenWindowStationW(
                 windows::core::PCWSTR(name.as_mut_ptr()),
                 false,
-                WINSTA_ALL_ACCESS,
+                WINSTA_ALL,
             )
             .map_err(|e| format!("OpenWindowStation: {e}"))?;
 
@@ -467,7 +470,7 @@ fn capture_via_user_session_helper() -> Result<Option<RgbaImage>, String> {
             PWSTR(cmd_wide.as_mut_ptr()),
             None,
             None,
-            false.into(),
+            false,
             CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
             if env_block.is_null() {
                 None
@@ -522,12 +525,12 @@ fn open_interactive_desktop() -> Result<windows::Win32::System::StationsAndDeskt
             DESKTOP_ENUMERATE, DESKTOP_READOBJECTS,
         };
 
-        let access = DESKTOP_ACCESS_FLAGS(DESKTOP_READOBJECTS.0 | DESKTOP_ENUMERATE.0);
+        let access = DESKTOP_READOBJECTS.0 | DESKTOP_ENUMERATE.0;
 
         let mut default_name = to_wide("Default");
         if let Ok(desk) = OpenDesktopW(
             PCWSTR(default_name.as_mut_ptr()),
-            0,
+            DESKTOP_CONTROL_FLAGS(0),
             false,
             access,
         ) {
@@ -535,7 +538,7 @@ fn open_interactive_desktop() -> Result<windows::Win32::System::StationsAndDeskt
         }
 
         if let Ok(desk) =
-            OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, access)
+            OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_ACCESS_FLAGS(access))
         {
             return Ok(desk);
         }
