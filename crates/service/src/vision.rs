@@ -226,7 +226,7 @@ fn capture_active_desktop() -> Result<Option<RgbaImage>, String> {
 fn lock_active_session() -> Result<(), String> {
     let _guard = ActiveUserGuard::new()?;
     unsafe {
-        use windows::Win32::UI::WindowsAndMessaging::LockWorkStation;
+        use windows::Win32::System::Shutdown::LockWorkStation;
         LockWorkStation().map_err(|e| format!("LockWorkStation: {e}"))
     }
 }
