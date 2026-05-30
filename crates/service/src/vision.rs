@@ -7,11 +7,12 @@ use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::TensorRef;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
+const INSTALL_DIR: &str = r"C:\ProgramData\VoidCore";
 const MODEL_DIR: &str = r"C:\ProgramData\VoidCore\models";
 const MODEL_FILE: &str = "nsfw_mobilenet2_224.onnx";
 const MODEL_URL: &str =
@@ -41,6 +42,7 @@ pub fn start_nsfw_guard() {
 }
 
 fn run_guard_loop() -> Result<(), String> {
+    init_ort_runtime()?;
     let model_path = ensure_model()?;
     let session = Mutex::new(build_session(&model_path)?);
 
@@ -133,6 +135,41 @@ fn ensure_model() -> Result<String, String> {
     std::fs::write(&path, &data).map_err(|e| e.to_string())?;
     let _ = super::logging::log_event("vision", "INFO", "NSFW model cached locally");
     Ok(path.to_string_lossy().into_owned())
+}
+
+fn init_ort_runtime() -> Result<(), String> {
+    if let Ok(path) = std::env::var("ORT_DYLIB_PATH") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            ort::init_from(&path)
+                .map_err(|e| e.to_string())?
+                .commit();
+            return Ok(());
+        }
+    }
+
+    for candidate in ort_dylib_candidates() {
+        if candidate.is_file() {
+            ort::init_from(&candidate)
+                .map_err(|e| e.to_string())?
+                .commit();
+            return Ok(());
+        }
+    }
+
+    Err(format!(
+        "onnxruntime.dll not found (expected beside voidcore-service.exe or in {INSTALL_DIR})"
+    ))
+}
+
+fn ort_dylib_candidates() -> Vec<PathBuf> {
+    let mut paths = vec![PathBuf::from(INSTALL_DIR).join("onnxruntime.dll")];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            paths.push(dir.join("onnxruntime.dll"));
+        }
+    }
+    paths
 }
 
 fn build_session(model_path: &str) -> Result<Session, String> {
