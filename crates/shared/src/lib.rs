@@ -23,7 +23,7 @@ pub struct RuntimeConfig {
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
-        let whitelist_raw = option_env!("APP_WHITELIST").unwrap_or("code,docker,python,wt,msedge,cursor,brave,vscodium");
+        let whitelist_raw = option_env!("APP_WHITELIST").unwrap_or("7z,7zfm,7zg,az,bash,brave,bravecrashhandler,braveupdate,cl,code,codium,com.docker.backend,com.docker.cli,docker,docker-desktop,docker-proxy,dockerd,dotnet,dsaservice,dsatray,func,git,git-bash,git-lfs,git-remote-https,imdisk,imdiskcpl,imdsksvc,link,msbuild,mspaint,mstsc,node,npm,npx,pip,pip3,postman,powershell,pwsh,py,python,pythonw,rg,sh,signtool,snippingtool,ssh,ssh-agent,ssh-keygen,ssms,tesseract,vctip,vpnkit,vs_installer,wg,winscp,wireguard,wsl,wslhost,wt");
         let blocklist_raw = option_env!("URL_BLOCKLIST").unwrap_or("reddit.com,twitter.com,x.com,instagram.com,facebook.com,tiktok.com,youtube.com,twitch.tv,netflix.com,9gag.com,discord.com");
         let publishers_raw = option_env!("TRUSTED_PUBLISHERS").unwrap_or("Microsoft Corporation,Brave Software,Docker Inc,Python Software Foundation,OpenJS Foundation,Postman,WireGuard,Martin Prikryl,Igor Pavlov,Intel Corporation,Johannes Schindelin,GitHub");
         
