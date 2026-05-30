@@ -159,6 +159,7 @@ mod service_impl_enforce {
         }
     }
 
+    /// Optimized: PowerShell is slow. This function is only called if the cache misses.
     fn get_authenticode_publisher(path: &str) -> Option<String> {
         let script = format!(
             "$s = Get-AuthenticodeSignature -LiteralPath '{}'; if ($s.Status -eq 'Valid') {{ $s.SignerCertificate.Subject }}",
@@ -192,6 +193,11 @@ mod service_impl_enforce {
                 };
                 
                 let mut last_notified: HashMap<String, Instant> = HashMap::new();
+                
+                // 🚀 BLUE TEAM OPTIMIZATION: Cryptographic Memory Cache
+                // Stores verified paths to drop CPU usage to 0% for repeated executions
+                let mut signature_cache: HashMap<String, String> = HashMap::new();
+                
                 let wmi_con = WMIConnection::new(com).unwrap();
                 
                 if let Ok(iterator) = wmi_con.notification::<Win32_ProcessStartTrace>() {
@@ -204,38 +210,25 @@ mod service_impl_enforce {
                             let mut is_ephemeral_installer = false;
                             let mut reason = String::new();
 
+                            // Fast-path bypass for absolute critical Windows internals
                             let critical = ["system","smss","csrss","wininit","winlogon","lsass","services","svchost","voidcore-service", "voidcore-gui", "voidcore-setup", "conhost", "cmd"];
                             if critical.contains(&name_lower.as_str()) { continue; }
 
+                            // Absolute block for impersonators
                             let junk = ["steam", "epicgameslauncher", "xboxapp", "gamebar", "riotclient"];
                             let is_junk = junk.iter().any(|j| name_lower.contains(j));
-
-                            if !is_junk {
-                                if cfg.whitelist.contains(&name_lower) {
-                                    allow = true;
-                                } else {
-                                    for w in &cfg.whitelist {
-                                        if (name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update")) 
-                                            && name_lower.contains(w) {
-                                            allow = true;
-                                            is_ephemeral_installer = true;
-                                            reason = format!("Heuristic match: {}", w);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
 
                             unsafe {
                                 if let Ok(proc_handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, false, trace.process_id) {
                                     
+                                    // PREVENT LYING LOGS (Zombie check)
                                     let mut exit_code: u32 = 0;
                                     if GetExitCodeProcess(proc_handle, &mut exit_code).is_ok() && exit_code != 259 {
                                         let _ = windows::Win32::Foundation::CloseHandle(proc_handle);
                                         continue; 
                                     }
 
-                                    if !allow && !is_junk {
+                                    if !is_junk {
                                         let mut buffer = [0u16; 1024];
                                         let mut size = buffer.len() as u32;
                                         
@@ -243,39 +236,53 @@ mod service_impl_enforce {
                                             let path = String::from_utf16_lossy(&buffer[..size as usize]);
                                             let path_lower = path.to_lowercase();
                                             
-                                            if path_lower.contains("\\windows\\system32\\") || 
-                                               path_lower.contains("\\windows\\syswow64\\") || 
-                                               path_lower.contains("\\windows\\systemapps\\") ||
-                                               path_lower.contains("\\windows\\immersivecontrolpanel\\") ||
-                                               path_lower.contains("\\windows\\explorer.exe") ||
-                                               path_lower.contains("\\program files\\windowsapps\\") {
-                                                allow = true;
-                                            }
+                                            // BLUE TEAM TIER 1: ACL-Aware Immutable Paths
+                                            // Because standard users cannot write to Program Files or Windows, 
+                                            // we trust ANY whitelisted app running from here. Closes the Rename Bypass.
+                                            let is_protected_dir = path_lower.starts_with("c:\\windows\\") || 
+                                                                   path_lower.starts_with("c:\\program files\\") || 
+                                                                   path_lower.starts_with("c:\\program files (x86)\\");
 
-                                            if !allow {
-                                                let trusted_paths = [
-                                                    "\\appdata\\local\\programs\\",
-                                                    "\\appdata\\roaming\\npm\\",
-                                                    "\\appdata\\local\\npm\\",
-                                                    "\\bravesoftware\\",
-                                                    "\\vscodium\\",
-                                                ];
-                                                if trusted_paths.iter().any(|tp| path_lower.contains(tp)) {
-                                                    allow = true;
-                                                }
+                                            if is_protected_dir && cfg.whitelist.contains(&name_lower) {
+                                                allow = true;
+                                                reason = "Whitelisted & ACL Protected".to_string();
                                             }
                                             
+                                            // BLUE TEAM TIER 2: User-Space Zero Trust (AppData, Downloads)
+                                            // If running from user space, MUST be verified by a Trusted Publisher
                                             if !allow && !cfg.trusted_publishers.is_empty() {
-                                                if let Some(subject) = get_authenticode_publisher(&path) {
+                                                
+                                                // Check RAM Cache first (0% CPU)
+                                                let subject_opt = if let Some(cached_subj) = signature_cache.get(&path_lower) {
+                                                    Some(cached_subj.clone())
+                                                } else {
+                                                    // Cache Miss: Query CryptoAPI (Heavy CPU)
+                                                    let subj = get_authenticode_publisher(&path);
+                                                    if let Some(s) = &subj {
+                                                        signature_cache.insert(path_lower.clone(), s.clone());
+                                                    }
+                                                    subj
+                                                };
+
+                                                if let Some(subject) = subject_opt {
                                                     let subject_lower = subject.to_lowercase();
                                                     for pub_name in &cfg.trusted_publishers {
                                                         if subject_lower.contains(&pub_name.to_lowercase()) {
-                                                            allow = true;
-                                                            reason = format!("Trusted Publisher: {}", pub_name);
-                                                            if name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update") {
-                                                                is_ephemeral_installer = true;
+                                                            
+                                                            // Publisher is trusted! Now check if the app name is allowed
+                                                            if cfg.whitelist.contains(&name_lower) {
+                                                                allow = true;
+                                                                reason = format!("Trusted Publisher Verified: {}", pub_name);
+                                                                break;
                                                             }
-                                                            break;
+                                                            
+                                                            // Installer Heuristic Timebomb
+                                                            if name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update") {
+                                                                allow = true;
+                                                                is_ephemeral_installer = true;
+                                                                reason = format!("Verified Installer: {}", pub_name);
+                                                                break;
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -289,7 +296,7 @@ mod service_impl_enforce {
                                         
                                         let now = Instant::now();
                                         if last_notified.get(&name_lower).map(|t| now.duration_since(*t).as_secs() > 60).unwrap_or(true) {
-                                            notify_user("VoidCore Security Guard", &format!("Blocked Execution:\n{}\n\nReason: Application is not in the whitelist or verified by a Trusted Publisher.", trace.process_name));
+                                            notify_user("VoidCore Security Guard", &format!("Blocked Execution:\n{}\n\nReason: Executable is not in an ACL-protected directory and lacks a valid Trusted Publisher signature.", trace.process_name));
                                             last_notified.insert(name_lower.clone(), now);
                                         }
                                         
@@ -305,14 +312,15 @@ mod service_impl_enforce {
                                         let pid = trace.process_id;
                                         thread::Builder::new().name(format!("timebomb-{}", pid)).spawn(move || {
                                             thread::sleep(Duration::from_secs(15 * 60));
-                                            // Completely removed the redundant unsafe block here
-                                            if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
-                                                let mut code = 0;
-                                                if GetExitCodeProcess(bomb_handle, &mut code).is_ok() && code == 259 {
-                                                    let _ = TerminateProcess(bomb_handle, 1);
-                                                    let _ = crate::logging::log_event("enforce", "BLOCK", "Timebomb detonated installer after 15m limit.");
+                                            unsafe {
+                                                if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+                                                    let mut code = 0;
+                                                    if GetExitCodeProcess(bomb_handle, &mut code).is_ok() && code == 259 {
+                                                        let _ = TerminateProcess(bomb_handle, 1);
+                                                        let _ = crate::logging::log_event("enforce", "BLOCK", "Timebomb detonated installer after 15m limit.");
+                                                    }
+                                                    let _ = windows::Win32::Foundation::CloseHandle(bomb_handle);
                                                 }
-                                                let _ = windows::Win32::Foundation::CloseHandle(bomb_handle);
                                             }
                                         }).ok();
                                     }
