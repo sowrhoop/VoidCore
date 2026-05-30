@@ -285,7 +285,8 @@ mod service_impl_enforce {
 
                                     if !allow {
                                         let _ = TerminateProcess(proc_handle, 1);
-                                        crate::logging::log_event("enforce", "BLOCK", &format!("Terminated: {}", name_lower));
+                                        // FIXED: Explicitly handle the Result by silencing the warning
+                                        let _ = crate::logging::log_event("enforce", "BLOCK", &format!("Terminated: {}", name_lower));
                                         
                                         let now = Instant::now();
                                         if last_notified.get(&name_lower).map(|t| now.duration_since(*t).as_secs() > 60).unwrap_or(true) {
@@ -294,7 +295,8 @@ mod service_impl_enforce {
                                         }
                                         
                                     } else if is_ephemeral_installer {
-                                        crate::logging::log_event("enforce", "ALLOW", &format!("Timebomb applied: {} ({})", name_lower, reason));
+                                        // FIXED: Explicitly handle the Result by silencing the warning
+                                        let _ = crate::logging::log_event("enforce", "ALLOW", &format!("Timebomb applied: {} ({})", name_lower, reason));
                                         
                                         let now = Instant::now();
                                         if last_notified.get(&name_lower).map(|t| now.duration_since(*t).as_secs() > 60).unwrap_or(true) {
@@ -305,14 +307,16 @@ mod service_impl_enforce {
                                         let pid = trace.process_id;
                                         thread::Builder::new().name(format!("timebomb-{}", pid)).spawn(move || {
                                             thread::sleep(Duration::from_secs(15 * 60));
-                                            // Fix: Redundant unsafe block removed here
-                                            if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
-                                                let mut code = 0;
-                                                if GetExitCodeProcess(bomb_handle, &mut code).is_ok() && code == 259 {
-                                                    let _ = TerminateProcess(bomb_handle, 1);
-                                                    crate::logging::log_event("enforce", "BLOCK", "Timebomb detonated installer after 15m limit.");
+                                            unsafe {
+                                                if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+                                                    let mut code = 0;
+                                                    if GetExitCodeProcess(bomb_handle, &mut code).is_ok() && code == 259 {
+                                                        let _ = TerminateProcess(bomb_handle, 1);
+                                                        // FIXED: Explicitly handle the Result by silencing the warning
+                                                        let _ = crate::logging::log_event("enforce", "BLOCK", "Timebomb detonated installer after 15m limit.");
+                                                    }
+                                                    let _ = windows::Win32::Foundation::CloseHandle(bomb_handle);
                                                 }
-                                                let _ = windows::Win32::Foundation::CloseHandle(bomb_handle);
                                             }
                                         }).ok();
                                     }
@@ -752,7 +756,6 @@ mod service_impl_ipc {
                                         let mut si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
                                         let mut pi = PROCESS_INFORMATION::default();
                                         
-                                        // FIXED: Strongly typed PROCESS_CREATION_FLAGS
                                         let success = CreateProcessWithLogonW(
                                             PCWSTR(user.as_ptr()),
                                             PCWSTR(domain.as_ptr()),
