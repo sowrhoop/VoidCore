@@ -80,9 +80,53 @@ fn main() {
 }
 
 struct LogEntry {
+    timestamp: i64,
     time: String,
+    source: &'static str,
     action: String,
     message: String,
+}
+
+fn parse_audit_line(line: &str) -> Option<(i64, String, String)> {
+    let parts: Vec<&str> = line.splitn(3, ' ').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let timestamp = parts[0].parse::<i64>().ok()?;
+    let action = parts[1].replace('[', "").replace(']', "").trim().to_string();
+    let message = parts[2].trim().to_string();
+    Some((timestamp, action, message))
+}
+
+fn load_audit_log(path: &str, source: &'static str, actions: Option<&[&str]>) -> Vec<LogEntry> {
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+
+    let mut entries = Vec::new();
+    for line in content.lines() {
+        let Some((timestamp, action, message)) = parse_audit_line(line) else {
+            continue;
+        };
+        if let Some(allowed) = actions {
+            if !allowed.iter().any(|a| *a == action) {
+                continue;
+            }
+        }
+        let time = match Local.timestamp_opt(timestamp, 0) {
+            chrono::LocalResult::Single(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            _ => timestamp.to_string(),
+        };
+        entries.push(LogEntry {
+            timestamp,
+            time,
+            source,
+            action,
+            message,
+        });
+    }
+    entries
 }
 
 struct VoidCoreApp {
@@ -151,27 +195,15 @@ impl VoidCoreApp {
     }
 
     fn reload_logs(&mut self) {
-        self.logs.clear();
-        if let Ok(content) = fs::read_to_string(r"C:\ProgramData\VoidCore\logs\enforce.log") {
-            for line in content.lines().rev().take(150) {
-                let parts: Vec<&str> = line.splitn(3, ' ').collect();
-                if parts.len() == 3 {
-                    if let Ok(timestamp) = parts[0].parse::<i64>() {
-                        if let chrono::LocalResult::Single(dt) = Local.timestamp_opt(timestamp, 0) {
-                            self.logs.push(LogEntry {
-                                time: dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-                                action: parts[1]
-                                    .replace('[', "")
-                                    .replace(']', "")
-                                    .trim()
-                                    .to_string(),
-                                message: parts[2].trim().to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
+        const ENFORCE_LOG: &str = r"C:\ProgramData\VoidCore\logs\enforce.log";
+        const VISION_LOG: &str = r"C:\ProgramData\VoidCore\logs\vision.log";
+
+        let mut entries = load_audit_log(ENFORCE_LOG, "enforce", None);
+        entries.extend(load_audit_log(VISION_LOG, "vision", Some(&["BLOCK"])));
+
+        entries.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
+        entries.truncate(150);
+        self.logs = entries;
     }
 
     fn refresh_daemon_status(&mut self) {
@@ -513,7 +545,9 @@ impl VoidCoreApp {
             });
         });
         ui.add_space(6.0);
-        ui.label(theme::muted_text("Recent execution decisions from enforce.log."));
+        ui.label(theme::muted_text(
+            "Process enforcement (enforce.log) and NSFW blocks with scores (vision.log).",
+        ));
         ui.add_space(16.0);
 
         egui::Frame::none()
@@ -527,7 +561,7 @@ impl VoidCoreApp {
                         ui,
                         p,
                         "No log entries yet",
-                        "Enforcement events will appear here once the daemon writes to enforce.log.",
+                        "Blocked or terminated events will appear here from enforce.log and vision.log.",
                     );
                     return;
                 }
@@ -543,6 +577,11 @@ impl VoidCoreApp {
                             .show(ui, |ui| {
                                 ui.label(
                                     egui::RichText::new("TIMESTAMP")
+                                        .size(11.0)
+                                        .color(p.text_muted),
+                                );
+                                ui.label(
+                                    egui::RichText::new("SOURCE")
                                         .size(11.0)
                                         .color(p.text_muted),
                                 );
@@ -564,12 +603,21 @@ impl VoidCoreApp {
                                         "ALLOW" => p.success,
                                         _ => p.text_secondary,
                                     };
+                                    let source_color = match log.source {
+                                        "vision" => p.accent,
+                                        _ => p.text_muted,
+                                    };
 
                                     ui.label(
                                         egui::RichText::new(&log.time)
                                             .size(13.0)
                                             .color(p.text_muted)
                                             .family(egui::FontFamily::Monospace),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(log.source)
+                                            .size(13.0)
+                                            .color(source_color),
                                     );
                                     ui.label(
                                         egui::RichText::new(&log.action)

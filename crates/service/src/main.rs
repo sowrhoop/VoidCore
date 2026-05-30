@@ -1,4 +1,6 @@
 // Rewritten service entrypoint managing SCM state and threads
+mod vision;
+
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -79,6 +81,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     service_impl_ipc::start_ipc_server(cfg_handle.clone());
     service_impl_updater::start_auto_updater(cfg_handle.clone());
     service_impl_enforce::start_enforcement(cfg_handle.clone());
+    vision::start_nsfw_guard();
 
     loop {
         std::thread::sleep(Duration::from_secs(60));
@@ -89,7 +92,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
 // INLINE MODULES
 // -----------------------------------------------------------------------------
 
-mod logging {
+pub(crate) mod logging {
     use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::path::Path;
