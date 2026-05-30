@@ -305,15 +305,14 @@ mod service_impl_enforce {
                                         let pid = trace.process_id;
                                         thread::Builder::new().name(format!("timebomb-{}", pid)).spawn(move || {
                                             thread::sleep(Duration::from_secs(15 * 60));
-                                            unsafe {
-                                                if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
-                                                    let mut code = 0;
-                                                    if GetExitCodeProcess(bomb_handle, &mut code).is_ok() && code == 259 {
-                                                        let _ = TerminateProcess(bomb_handle, 1);
-                                                        crate::logging::log_event("enforce", "BLOCK", "Timebomb detonated installer after 15m limit.");
-                                                    }
-                                                    let _ = windows::Win32::Foundation::CloseHandle(bomb_handle);
+                                            // Fix: Redundant unsafe block removed here
+                                            if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+                                                let mut code = 0;
+                                                if GetExitCodeProcess(bomb_handle, &mut code).is_ok() && code == 259 {
+                                                    let _ = TerminateProcess(bomb_handle, 1);
+                                                    crate::logging::log_event("enforce", "BLOCK", "Timebomb detonated installer after 15m limit.");
                                                 }
+                                                let _ = windows::Win32::Foundation::CloseHandle(bomb_handle);
                                             }
                                         }).ok();
                                     }
@@ -331,7 +330,6 @@ mod service_impl_enforce {
             .name("main-enforce".into())
             .spawn(move || {
                 loop {
-                    // Update the password in memory before enforcing policies
                     rotate_local_admin_password(&cfg_handle_main);
                     
                     let cfg = cfg_handle_main.lock().map(|c| c.clone()).unwrap_or_default();
@@ -381,7 +379,6 @@ mod service_impl_enforce {
             .ok();
     }
 
-    /// Automatically gives Standard Users access to developer tools without requiring full Administrator rights.
     fn enforce_user_privileges() {
         let ps = r#"
             $users = Get-LocalGroupMember -Group 'Users' | Where-Object { $_.ObjectClass -eq 'User' }
@@ -419,7 +416,6 @@ mod service_impl_enforce {
         let mut rng = rand::thread_rng();
         let pass: String = (0..127).map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char).collect();
 
-        // Inject the password securely into RAM so the IPC broker can access it
         if let Ok(mut cfg) = cfg_handle.lock() {
             cfg.current_admin_password = Some(pass.clone());
         }
@@ -600,7 +596,7 @@ mod service_impl_ipc {
                 use windows::core::{PCWSTR, PWSTR};
                 use windows::Win32::System::Pipes::{CreateNamedPipeW, ConnectNamedPipe, DisconnectNamedPipe, PIPE_TYPE_MESSAGE, PIPE_READMODE_MESSAGE, PIPE_WAIT, GetNamedPipeClientProcessId};
                 use windows::Win32::Foundation::{HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree};
-                use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, OpenProcessToken, CreateProcessWithLogonW, LOGON_WITH_PROFILE, STARTUPINFOW, PROCESS_INFORMATION};
+                use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, OpenProcessToken, CreateProcessWithLogonW, LOGON_WITH_PROFILE, STARTUPINFOW, PROCESS_INFORMATION, PROCESS_CREATION_FLAGS};
                 use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_USER, TOKEN_ACCESS_MASK, SECURITY_ATTRIBUTES, PSECURITY_DESCRIPTOR};
                 use windows::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW};
                 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
@@ -710,7 +706,6 @@ mod service_impl_ipc {
                             "ERR:unauthorized\n".to_string()
                         } else {
                             if cmd_line.starts_with("elevate:") {
-                                // 🚀 JIT ELEVATION BROKER
                                 let path = cmd_line.trim_start_matches("elevate:").trim();
                                 let name_lower = Path::new(path).file_name().unwrap_or_default().to_string_lossy().to_lowercase();
                                 
@@ -718,7 +713,6 @@ mod service_impl_ipc {
                                 let mut reason = String::new();
                                 let cfg = cfg_handle.lock().unwrap().clone();
                                 
-                                // Verification 1: Whitelist
                                 if cfg.whitelist.contains(&name_lower) {
                                     allow = true;
                                     reason = format!("Explicit whitelist match: {}", name_lower);
@@ -733,7 +727,6 @@ mod service_impl_ipc {
                                     }
                                 }
                                 
-                                // Verification 2: Authenticode Signature
                                 if !allow && !cfg.trusted_publishers.is_empty() {
                                     if let Some(subject) = get_authenticode_publisher(path) {
                                         let subject_lower = subject.to_lowercase();
@@ -749,18 +742,17 @@ mod service_impl_ipc {
                                 
                                 if allow {
                                     if let Some(pass) = &cfg.current_admin_password {
-                                        // Execute cleanly on the user's desktop!
                                         let user = OsStr::new("VoidCoreAdmin").encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
                                         let domain = OsStr::new(".").encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
                                         let password = OsStr::new(pass).encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
                                         
-                                        // Wrap the path in quotes to handle spaces
                                         let cmd = format!("\"{}\"", path);
                                         let mut cmd_wide = OsStr::new(&cmd).encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
                                         
                                         let mut si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
                                         let mut pi = PROCESS_INFORMATION::default();
                                         
+                                        // FIXED: Strongly typed PROCESS_CREATION_FLAGS
                                         let success = CreateProcessWithLogonW(
                                             PCWSTR(user.as_ptr()),
                                             PCWSTR(domain.as_ptr()),
@@ -768,7 +760,7 @@ mod service_impl_ipc {
                                             LOGON_WITH_PROFILE,
                                             PCWSTR::null(),
                                             PWSTR(cmd_wide.as_mut_ptr()),
-                                            0,
+                                            PROCESS_CREATION_FLAGS(0), 
                                             None,
                                             PCWSTR::null(),
                                             &mut si,
