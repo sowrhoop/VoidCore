@@ -17,6 +17,9 @@ const SERVICE_NAME: &str = "VoidCoreDaemon";
 define_windows_service!(ffi_service_main, my_service_main);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if vision::try_run_snapshot_cli() {
+        return Ok(());
+    }
     if let Err(_) = service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
         let _ = logging::log_event("core", "WARN", "Running outside of SCM");
         run_service()?;

@@ -6,16 +6,19 @@ use ndarray::Array4;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::TensorRef;
+use std::ffi::OsStr;
 use std::io::Read;
+use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const MODEL_DIR: &str = r"C:\ProgramData\VoidCore\models";
 const MODEL_FILE: &str = "nsfw_mobilenet2_224.onnx";
 const MODEL_URL: &str =
-    "https://raw.githubusercontent.com/Kazuhito00/nsfw_model_onnx_sample/main/model/nsfw_mobilenet2_224x224.onnx";
+    "https://raw.githubusercontent.com/Kazuhito00/nsfw_model_onnx_sample/main/model/nsfw_mobilenet2_224.onnx";
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(5);
 const LOCK_THRESHOLD: f32 = 0.85;
@@ -24,6 +27,30 @@ const INPUT_SIZE: u32 = 224;
 
 /// GantMan/nsfw_model class order (alphabetical in training code).
 const CLASS_LABELS: [&str; 5] = ["drawings", "hentai", "neutral", "porn", "sexy"];
+
+static LAST_CAPTURE_WARN: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+static HELPER_MODE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// CLI entry for a short-lived capture helper spawned in the user's session.
+pub fn try_run_snapshot_cli() -> bool {
+    let args: Vec<String> = std::env::args().collect();
+    let Some(out_path) = args
+        .windows(2)
+        .find(|w| w[0] == "--vision-snapshot")
+        .map(|w| w[1].clone())
+    else {
+        return false;
+    };
+
+    match capture_desktop_direct() {
+        Ok(Some(img)) => {
+            let code = if img.save(&out_path).is_ok() { 0 } else { 1 };
+            std::process::exit(code);
+        }
+        Ok(None) => std::process::exit(2),
+        Err(_) => std::process::exit(1),
+    }
+}
 
 pub fn start_nsfw_guard() {
     thread::Builder::new()
@@ -63,11 +90,7 @@ fn run_guard_loop() -> Result<(), String> {
             Ok(Some(img)) => img,
             Ok(None) => continue,
             Err(e) => {
-                let _ = super::logging::log_event(
-                    "vision",
-                    "WARN",
-                    &format!("Screen capture skipped: {e}"),
-                );
+                log_capture_skip(&e);
                 continue;
             }
         };
@@ -102,6 +125,22 @@ fn run_guard_loop() -> Result<(), String> {
             );
         }
     }
+}
+
+fn log_capture_skip(msg: &str) {
+    let mut guard = LAST_CAPTURE_WARN.lock().unwrap();
+    let now = Instant::now();
+    if let Some((ref prev, ref t)) = *guard {
+        if prev == msg && t.elapsed() < Duration::from_secs(60) {
+            return;
+        }
+    }
+    *guard = Some((msg.to_string(), now));
+    let _ = super::logging::log_event(
+        "vision",
+        "WARN",
+        &format!("Screen capture skipped: {msg}"),
+    );
 }
 
 fn ensure_model() -> Result<String, String> {
@@ -215,12 +254,50 @@ fn top_illicit_label(scores: &[f32; 5]) -> &'static str {
     CLASS_LABELS[best]
 }
 
+fn is_desktop_access_error(err: &str) -> bool {
+    err.contains("OpenInputDesktop")
+        || err.contains("OpenDesktop")
+        || err.contains("Incorrect function")
+        || err.contains("SetThreadDesktop")
+        || err.contains("OpenWindowStation")
+        || err.contains("SetProcessWindowStation")
+}
+
 fn capture_active_desktop() -> Result<Option<RgbaImage>, String> {
-    let _guard = match ActiveUserGuard::new() {
+    let guard = match ActiveUserGuard::new() {
         Ok(g) => g,
         Err(_) => return Ok(None),
     };
-    capture_input_desktop()
+
+    let inline = (|| {
+        ensure_interactive_window_station()?;
+        capture_input_desktop()
+    })();
+
+    match inline {
+        Ok(img) => Ok(img),
+        Err(e) if is_desktop_access_error(&e) => {
+            drop(guard);
+            match capture_via_user_session_helper() {
+                Ok(img) => {
+                    if !HELPER_MODE_LOGGED.swap(true, Ordering::Relaxed) {
+                        let _ = super::logging::log_event(
+                            "vision",
+                            "INFO",
+                            "Screen capture using user-session helper (Session 0 service)",
+                        );
+                    }
+                    Ok(img)
+                }
+                Err(helper_err) => Err(format!("inline: {e}; helper: {helper_err}")),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn capture_desktop_direct() -> Result<Option<RgbaImage>, String> {
+    bitblt_screen()
 }
 
 fn lock_active_session() -> Result<(), String> {
@@ -238,7 +315,11 @@ struct ActiveUserGuard {
 impl ActiveUserGuard {
     fn new() -> Result<Self, String> {
         unsafe {
-            use windows::Win32::Security::ImpersonateLoggedOnUser;
+            use windows::Win32::Foundation::CloseHandle;
+            use windows::Win32::Security::{
+                DuplicateTokenEx, ImpersonateLoggedOnUser, SecurityImpersonation, TokenImpersonation,
+                TOKEN_ALL_ACCESS,
+            };
             use windows::Win32::System::RemoteDesktop::{
                 WTSGetActiveConsoleSessionId, WTSQueryUserToken,
             };
@@ -248,11 +329,30 @@ impl ActiveUserGuard {
                 return Err("no active console session".into());
             }
 
-            let mut token = windows::Win32::Foundation::HANDLE::default();
-            WTSQueryUserToken(session, &mut token).map_err(|e| e.to_string())?;
-            ImpersonateLoggedOnUser(token).map_err(|e| e.to_string())?;
+            let mut session_token = windows::Win32::Foundation::HANDLE::default();
+            WTSQueryUserToken(session, &mut session_token).map_err(|e| e.to_string())?;
 
-            Ok(Self { token })
+            let mut imp_token = windows::Win32::Foundation::HANDLE::default();
+            DuplicateTokenEx(
+                session_token,
+                TOKEN_ALL_ACCESS,
+                None,
+                SecurityImpersonation,
+                TokenImpersonation,
+                &mut imp_token,
+            )
+            .map_err(|e| {
+                let _ = CloseHandle(session_token);
+                e.to_string()
+            })?;
+            let _ = CloseHandle(session_token);
+
+            ImpersonateLoggedOnUser(imp_token).map_err(|e| {
+                let _ = CloseHandle(imp_token);
+                e.to_string()
+            })?;
+
+            Ok(Self { token: imp_token })
         }
     }
 }
@@ -270,24 +370,189 @@ impl Drop for ActiveUserGuard {
     }
 }
 
+fn ensure_interactive_window_station() -> Result<(), String> {
+    static WINSTA: OnceLock<Result<(), String>> = OnceLock::new();
+    WINSTA
+        .get_or_init(|| unsafe {
+            use windows::Win32::Foundation::GetLastError;
+            use windows::Win32::System::StationsAndDesktops::{
+                CloseWindowStation, OpenWindowStationW, SetProcessWindowStation, WINSTA_ALL_ACCESS,
+            };
+
+            let mut name = to_wide("WinSta0");
+            let winsta = OpenWindowStationW(
+                windows::core::PCWSTR(name.as_mut_ptr()),
+                false,
+                WINSTA_ALL_ACCESS,
+            )
+            .map_err(|e| format!("OpenWindowStation: {e}"))?;
+
+            if SetProcessWindowStation(winsta).is_err() {
+                let _ = CloseWindowStation(winsta);
+                return Err(format!(
+                    "SetProcessWindowStation: {:?}",
+                    GetLastError()
+                ));
+            }
+            Ok(())
+        })
+        .clone()
+}
+
+fn capture_via_user_session_helper() -> Result<Option<RgbaImage>, String> {
+    let session = unsafe { windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId() };
+    if session == 0xFFFF_FFFF {
+        return Ok(None);
+    }
+
+    let snapshot_path = std::env::temp_dir().join(format!(
+        "voidcore-vision-{}.png",
+        std::process::id()
+    ));
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let cmd = format!(
+        "\"{}\" --vision-snapshot \"{}\"",
+        exe.display(),
+        snapshot_path.display()
+    );
+
+    unsafe {
+        use windows::core::{PCWSTR, PWSTR};
+        use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+        use windows::Win32::Security::{
+            DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS,
+        };
+        use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
+        use windows::Win32::System::RemoteDesktop::WTSQueryUserToken;
+        use windows::Win32::System::Threading::{
+            CreateProcessAsUserW, GetExitCodeProcess, WaitForSingleObject, CREATE_NO_WINDOW,
+            CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
+        };
+
+        let mut user_token = HANDLE::default();
+        WTSQueryUserToken(session, &mut user_token)
+            .map_err(|e| format!("WTSQueryUserToken: {e}"))?;
+
+        let mut primary = HANDLE::default();
+        DuplicateTokenEx(
+            user_token,
+            TOKEN_ALL_ACCESS,
+            None,
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut primary,
+        )
+        .map_err(|e| {
+            let _ = CloseHandle(user_token);
+            format!("DuplicateTokenEx: {e}")
+        })?;
+        let _ = CloseHandle(user_token);
+
+        let mut env_block = std::ptr::null_mut();
+        let _ = CreateEnvironmentBlock(&mut env_block, primary, false);
+
+        let mut cmd_wide = to_wide(&cmd);
+        let mut desktop_wide = to_wide("winsta0\\default");
+
+        let mut si = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            lpDesktop: PWSTR(desktop_wide.as_mut_ptr()),
+            ..Default::default()
+        };
+        let mut pi = PROCESS_INFORMATION::default();
+
+        let create_result = CreateProcessAsUserW(
+            primary,
+            PCWSTR::null(),
+            PWSTR(cmd_wide.as_mut_ptr()),
+            None,
+            None,
+            false.into(),
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            if env_block.is_null() {
+                None
+            } else {
+                Some(env_block as *const _)
+            },
+            PCWSTR::null(),
+            &mut si,
+            &mut pi,
+        );
+
+        if !env_block.is_null() {
+            let _ = DestroyEnvironmentBlock(env_block);
+        }
+        let _ = CloseHandle(primary);
+
+        create_result.map_err(|e| format!("CreateProcessAsUserW: {e}"))?;
+
+        let wait = WaitForSingleObject(pi.hProcess, 15000);
+        let mut exit_code = 1u32;
+        let _ = GetExitCodeProcess(pi.hProcess, &mut exit_code);
+        let _ = CloseHandle(pi.hProcess);
+        let _ = CloseHandle(pi.hThread);
+
+        if wait != WAIT_OBJECT_0 || exit_code != 0 {
+            let _ = std::fs::remove_file(&snapshot_path);
+            return Err(format!("snapshot helper exit={exit_code}"));
+        }
+    }
+
+    if !snapshot_path.exists() {
+        return Err("snapshot file missing".into());
+    }
+
+    let img = image::open(&snapshot_path)
+        .map_err(|e| e.to_string())?
+        .to_rgba8();
+    let _ = std::fs::remove_file(&snapshot_path);
+    Ok(Some(img))
+}
+
+fn to_wide(s: &str) -> Vec<u16> {
+    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+}
+
+fn open_interactive_desktop() -> Result<windows::Win32::System::StationsAndDesktops::HDESK, String> {
+    unsafe {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::GetLastError;
+        use windows::Win32::System::StationsAndDesktops::{
+            OpenDesktopW, OpenInputDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS,
+            DESKTOP_ENUMERATE, DESKTOP_READOBJECTS,
+        };
+
+        let access = DESKTOP_ACCESS_FLAGS(DESKTOP_READOBJECTS.0 | DESKTOP_ENUMERATE.0);
+
+        let mut default_name = to_wide("Default");
+        if let Ok(desk) = OpenDesktopW(
+            PCWSTR(default_name.as_mut_ptr()),
+            0,
+            false,
+            access,
+        ) {
+            return Ok(desk);
+        }
+
+        if let Ok(desk) =
+            OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, access)
+        {
+            return Ok(desk);
+        }
+
+        Err(format!("OpenDesktop: {:?}", GetLastError()))
+    }
+}
+
 fn capture_input_desktop() -> Result<Option<RgbaImage>, String> {
     unsafe {
         use windows::Win32::Foundation::GetLastError;
-        use windows::Win32::Graphics::Gdi::{
-            BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
-            GetDC, GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER,
-            BI_RGB, DIB_RGB_COLORS, SRCCOPY,
-        };
         use windows::Win32::System::StationsAndDesktops::{
-            CloseDesktop, GetThreadDesktop, OpenInputDesktop, SetThreadDesktop,
-            DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, DESKTOP_ENUMERATE, DESKTOP_READOBJECTS,
+            CloseDesktop, GetThreadDesktop, SetThreadDesktop,
         };
         use windows::Win32::System::Threading::GetCurrentThreadId;
-        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
-        let access = DESKTOP_ACCESS_FLAGS(DESKTOP_READOBJECTS.0 | DESKTOP_ENUMERATE.0);
-        let desktop = OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, access)
-            .map_err(|e| format!("OpenInputDesktop: {e}"))?;
+        let desktop = open_interactive_desktop()?;
         let old_desktop = GetThreadDesktop(GetCurrentThreadId())
             .map_err(|e| format!("GetThreadDesktop: {e}"))?;
         if SetThreadDesktop(desktop).is_err() {
@@ -295,25 +560,48 @@ fn capture_input_desktop() -> Result<Option<RgbaImage>, String> {
             return Err(format!("SetThreadDesktop: {:?}", GetLastError()));
         }
 
+        let result = bitblt_screen();
+
+        let _ = SetThreadDesktop(old_desktop);
+        let _ = CloseDesktop(desktop);
+        result
+    }
+}
+
+fn bitblt_screen() -> Result<Option<RgbaImage>, String> {
+    unsafe {
+        use windows::Win32::Graphics::Gdi::{
+            BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
+            GetDC, GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER,
+            BI_RGB, DIB_RGB_COLORS, SRCCOPY,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+
         let width = GetSystemMetrics(SM_CXSCREEN) as u32;
         let height = GetSystemMetrics(SM_CYSCREEN) as u32;
         if width == 0 || height == 0 {
-            let _ = SetThreadDesktop(old_desktop);
-            let _ = CloseDesktop(desktop);
             return Ok(None);
         }
 
         let hdc_screen = GetDC(None);
         if hdc_screen.0 == 0 {
-            let _ = SetThreadDesktop(old_desktop);
-            let _ = CloseDesktop(desktop);
             return Err("GetDC failed".into());
         }
 
         let hdc_mem = CreateCompatibleDC(hdc_screen);
         let hbm = CreateCompatibleBitmap(hdc_screen, width as i32, height as i32);
         let old_bm = SelectObject(hdc_mem, hbm);
-        let blt_ok = BitBlt(hdc_mem, 0, 0, width as i32, height as i32, hdc_screen, 0, 0, SRCCOPY);
+        let blt_ok = BitBlt(
+            hdc_mem,
+            0,
+            0,
+            width as i32,
+            height as i32,
+            hdc_screen,
+            0,
+            0,
+            SRCCOPY,
+        );
 
         let mut bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -348,8 +636,6 @@ fn capture_input_desktop() -> Result<Option<RgbaImage>, String> {
         let _ = DeleteObject(hbm);
         let _ = DeleteDC(hdc_mem);
         let _ = ReleaseDC(None, hdc_screen);
-        let _ = SetThreadDesktop(old_desktop);
-        let _ = CloseDesktop(desktop);
 
         if lines == 0 {
             return Err("GetDIBits failed".into());
