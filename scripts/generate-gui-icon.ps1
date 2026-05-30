@@ -13,7 +13,8 @@ if (-not (Test-Path $png)) {
 python -c @"
 from PIL import Image
 img = Image.open(r'$png').convert('RGBA')
+img.save(r'$png', format='PNG', optimize=True)
 sizes = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
 img.save(r'$ico', format='ICO', sizes=sizes)
-print('Wrote', r'$ico')
+print('Wrote', r'$ico', 'from PNG', img.size)
 "@
