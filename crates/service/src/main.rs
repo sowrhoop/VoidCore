@@ -159,7 +159,6 @@ mod service_impl_enforce {
         }
     }
 
-    /// Optimized: PowerShell is slow. This function is only called if the cache misses.
     fn get_authenticode_publisher(path: &str) -> Option<String> {
         let script = format!(
             "$s = Get-AuthenticodeSignature -LiteralPath '{}'; if ($s.Status -eq 'Valid') {{ $s.SignerCertificate.Subject }}",
@@ -193,11 +192,7 @@ mod service_impl_enforce {
                 };
                 
                 let mut last_notified: HashMap<String, Instant> = HashMap::new();
-                
-                // 🚀 BLUE TEAM OPTIMIZATION: Cryptographic Memory Cache
-                // Stores verified paths to drop CPU usage to 0% for repeated executions
                 let mut signature_cache: HashMap<String, String> = HashMap::new();
-                
                 let wmi_con = WMIConnection::new(com).unwrap();
                 
                 if let Ok(iterator) = wmi_con.notification::<Win32_ProcessStartTrace>() {
@@ -210,18 +205,15 @@ mod service_impl_enforce {
                             let mut is_ephemeral_installer = false;
                             let mut reason = String::new();
 
-                            // Fast-path bypass for absolute critical Windows internals
                             let critical = ["system","smss","csrss","wininit","winlogon","lsass","services","svchost","voidcore-service", "voidcore-gui", "voidcore-setup", "conhost", "cmd"];
                             if critical.contains(&name_lower.as_str()) { continue; }
 
-                            // Absolute block for impersonators
                             let junk = ["steam", "epicgameslauncher", "xboxapp", "gamebar", "riotclient"];
                             let is_junk = junk.iter().any(|j| name_lower.contains(j));
 
                             unsafe {
                                 if let Ok(proc_handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, false, trace.process_id) {
                                     
-                                    // PREVENT LYING LOGS (Zombie check)
                                     let mut exit_code: u32 = 0;
                                     if GetExitCodeProcess(proc_handle, &mut exit_code).is_ok() && exit_code != 259 {
                                         let _ = windows::Win32::Foundation::CloseHandle(proc_handle);
@@ -236,9 +228,6 @@ mod service_impl_enforce {
                                             let path = String::from_utf16_lossy(&buffer[..size as usize]);
                                             let path_lower = path.to_lowercase();
                                             
-                                            // BLUE TEAM TIER 1: ACL-Aware Immutable Paths
-                                            // Because standard users cannot write to Program Files or Windows, 
-                                            // we trust ANY whitelisted app running from here. Closes the Rename Bypass.
                                             let is_protected_dir = path_lower.starts_with("c:\\windows\\") || 
                                                                    path_lower.starts_with("c:\\program files\\") || 
                                                                    path_lower.starts_with("c:\\program files (x86)\\");
@@ -248,15 +237,10 @@ mod service_impl_enforce {
                                                 reason = "Whitelisted & ACL Protected".to_string();
                                             }
                                             
-                                            // BLUE TEAM TIER 2: User-Space Zero Trust (AppData, Downloads)
-                                            // If running from user space, MUST be verified by a Trusted Publisher
                                             if !allow && !cfg.trusted_publishers.is_empty() {
-                                                
-                                                // Check RAM Cache first (0% CPU)
                                                 let subject_opt = if let Some(cached_subj) = signature_cache.get(&path_lower) {
                                                     Some(cached_subj.clone())
                                                 } else {
-                                                    // Cache Miss: Query CryptoAPI (Heavy CPU)
                                                     let subj = get_authenticode_publisher(&path);
                                                     if let Some(s) = &subj {
                                                         signature_cache.insert(path_lower.clone(), s.clone());
@@ -268,15 +252,11 @@ mod service_impl_enforce {
                                                     let subject_lower = subject.to_lowercase();
                                                     for pub_name in &cfg.trusted_publishers {
                                                         if subject_lower.contains(&pub_name.to_lowercase()) {
-                                                            
-                                                            // Publisher is trusted! Now check if the app name is allowed
                                                             if cfg.whitelist.contains(&name_lower) {
                                                                 allow = true;
                                                                 reason = format!("Trusted Publisher Verified: {}", pub_name);
                                                                 break;
                                                             }
-                                                            
-                                                            // Installer Heuristic Timebomb
                                                             if name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update") {
                                                                 allow = true;
                                                                 is_ephemeral_installer = true;
@@ -338,7 +318,7 @@ mod service_impl_enforce {
             .name("main-enforce".into())
             .spawn(move || {
                 loop {
-                    rotate_local_admin_password(&cfg_handle_main);
+                    rotate_local_admin_password();
                     
                     let cfg = cfg_handle_main.lock().map(|c| c.clone()).unwrap_or_default();
                     enforce_global_mullvad_dns();
@@ -418,15 +398,11 @@ mod service_impl_enforce {
         let _ = std::process::Command::new("powershell").args(["-NoProfile","-NonInteractive","-WindowStyle","Hidden","-Command", ps]).output();
     }
 
-    fn rotate_local_admin_password(cfg_handle: &std::sync::Arc<std::sync::Mutex<RuntimeConfig>>) {
+    fn rotate_local_admin_password() {
         use rand::Rng;
         const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+[]{}|;:,.<>?/";
         let mut rng = rand::thread_rng();
         let pass: String = (0..127).map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char).collect();
-
-        if let Ok(mut cfg) = cfg_handle.lock() {
-            cfg.current_admin_password = Some(pass.clone());
-        }
 
         let user_w = to_wide("VoidCoreAdmin");
         let mut pass_w = to_wide(&pass);
@@ -567,6 +543,7 @@ mod service_impl_ipc {
     use std::os::windows::ffi::OsStrExt;
     use std::sync::{Arc, Mutex};
     use std::os::windows::io::FromRawHandle;
+    use std::ffi::c_void;
     use voidcore_shared::RuntimeConfig;
 
     fn log_ipc_auth_failure(install_dir: &Path, token_line: &str, cmd: &str, reason: &str) {
@@ -604,8 +581,9 @@ mod service_impl_ipc {
                 use windows::core::{PCWSTR, PWSTR};
                 use windows::Win32::System::Pipes::{CreateNamedPipeW, ConnectNamedPipe, DisconnectNamedPipe, PIPE_TYPE_MESSAGE, PIPE_READMODE_MESSAGE, PIPE_WAIT, GetNamedPipeClientProcessId};
                 use windows::Win32::Foundation::{HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree};
-                use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, OpenProcessToken, CreateProcessWithLogonW, LOGON_WITH_PROFILE, STARTUPINFOW, PROCESS_INFORMATION, PROCESS_CREATION_FLAGS};
-                use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_USER, TOKEN_ACCESS_MASK, SECURITY_ATTRIBUTES, PSECURITY_DESCRIPTOR};
+                use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, OpenProcessToken, CreateProcessAsUserW, GetCurrentProcess, STARTUPINFOW, PROCESS_INFORMATION, PROCESS_CREATION_FLAGS};
+                use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
+                use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_USER, TOKEN_ACCESS_MASK, SECURITY_ATTRIBUTES, PSECURITY_DESCRIPTOR, DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS, SetTokenInformation, TokenSessionId};
                 use windows::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW};
                 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 
@@ -749,40 +727,78 @@ mod service_impl_ipc {
                                 }
                                 
                                 if allow {
-                                    if let Some(pass) = &cfg.current_admin_password {
-                                        let user = OsStr::new("VoidCoreAdmin").encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
-                                        let domain = OsStr::new(".").encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
-                                        let password = OsStr::new(pass).encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
-                                        
-                                        let cmd = format!("\"{}\"", path);
-                                        let mut cmd_wide = OsStr::new(&cmd).encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
-                                        
-                                        let mut si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
-                                        let mut pi = PROCESS_INFORMATION::default();
-                                        
-                                        let success = CreateProcessWithLogonW(
-                                            PCWSTR(user.as_ptr()),
-                                            PCWSTR(domain.as_ptr()),
-                                            PCWSTR(password.as_ptr()),
-                                            LOGON_WITH_PROFILE,
-                                            PCWSTR::null(),
-                                            PWSTR(cmd_wide.as_mut_ptr()),
-                                            PROCESS_CREATION_FLAGS(0), 
-                                            None,
-                                            PCWSTR::null(),
-                                            &mut si,
-                                            &mut pi,
-                                        );
-                                        
-                                        if success.is_ok() {
-                                            let _ = windows::Win32::Foundation::CloseHandle(pi.hProcess);
-                                            let _ = windows::Win32::Foundation::CloseHandle(pi.hThread);
-                                            format!("OK: Process elevated successfully.\nReason: {}\n", reason)
-                                        } else {
-                                            "ERR: Windows refused to elevate the process. Ensure the path is correct.\n".to_string()
-                                        }
+                                    // 🚀 ADVANCED ELEVATION: SYSTEM Token Duplication
+                                    // Instead of logging in as VoidCoreAdmin (which triggers UAC and blocks AppData),
+                                    // we duplicate the Daemon's SYSTEM token and inject it into the active user session!
+                                    let session_id = WTSGetActiveConsoleSessionId();
+                                    
+                                    if session_id == 0xFFFFFFFF {
+                                        "ERR: No active user session found to display the installer.\n".to_string()
                                     } else {
-                                        "ERR: Admin password not initialized. Please wait 1 minute.\n".to_string()
+                                        let mut sys_token = HANDLE(0);
+                                        if OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut sys_token).is_ok() {
+                                            
+                                            let mut dup_token = HANDLE(0);
+                                            if DuplicateTokenEx(
+                                                sys_token,
+                                                TOKEN_ALL_ACCESS.0,
+                                                None,
+                                                SecurityImpersonation,
+                                                TokenPrimary,
+                                                &mut dup_token
+                                            ).is_ok() {
+                                                
+                                                // Mount the SYSTEM token into the visual user session
+                                                let _ = SetTokenInformation(
+                                                    dup_token,
+                                                    TokenSessionId,
+                                                    &session_id as *const _ as *const c_void,
+                                                    4
+                                                );
+
+                                                let cmd = format!("\"{}\"", path);
+                                                let mut cmd_wide = OsStr::new(&cmd).encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
+                                                let mut desktop_wide = OsStr::new("winsta0\\default").encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
+                                                
+                                                let mut si = STARTUPINFOW { 
+                                                    cb: std::mem::size_of::<STARTUPINFOW>() as u32, 
+                                                    lpDesktop: PWSTR(desktop_wide.as_mut_ptr()),
+                                                    ..Default::default() 
+                                                };
+                                                let mut pi = PROCESS_INFORMATION::default();
+                                                
+                                                let success = CreateProcessAsUserW(
+                                                    dup_token,
+                                                    PCWSTR::null(),
+                                                    PWSTR(cmd_wide.as_mut_ptr()),
+                                                    None,
+                                                    None,
+                                                    windows::Win32::Foundation::BOOL(0),
+                                                    PROCESS_CREATION_FLAGS(0), 
+                                                    None,
+                                                    PCWSTR::null(),
+                                                    &mut si,
+                                                    &mut pi,
+                                                );
+                                                
+                                                if success.is_ok() {
+                                                    let _ = windows::Win32::Foundation::CloseHandle(pi.hProcess);
+                                                    let _ = windows::Win32::Foundation::CloseHandle(pi.hThread);
+                                                    let _ = windows::Win32::Foundation::CloseHandle(dup_token);
+                                                    let _ = windows::Win32::Foundation::CloseHandle(sys_token);
+                                                    format!("OK: Process elevated to NT AUTHORITY\\SYSTEM successfully.\nReason: {}\n", reason)
+                                                } else {
+                                                    let _ = windows::Win32::Foundation::CloseHandle(dup_token);
+                                                    let _ = windows::Win32::Foundation::CloseHandle(sys_token);
+                                                    "ERR: Windows refused to elevate the process. Ensure the path is correct.\n".to_string()
+                                                }
+                                            } else {
+                                                let _ = windows::Win32::Foundation::CloseHandle(sys_token);
+                                                "ERR: Failed to duplicate the SYSTEM token.\n".to_string()
+                                            }
+                                        } else {
+                                            "ERR: Failed to fetch the daemon SYSTEM token.\n".to_string()
+                                        }
                                     }
                                 } else {
                                     "ERR: Request denied. Executable does not match any Whitelist or Trusted Publisher policy.\n".to_string()
