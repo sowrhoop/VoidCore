@@ -205,7 +205,6 @@ mod service_impl_enforce {
                             let mut is_ephemeral_installer = false;
                             let mut reason = String::new();
 
-                            // 🚨 PREVENT DESKTOP CRASHES: Explicit UI Exclusion
                             let critical = [
                                 "system","smss","csrss","wininit","winlogon","lsass","services","svchost",
                                 "explorer","taskhostw","dwm","searchhost","startmenuexperiencehost",
@@ -234,42 +233,22 @@ mod service_impl_enforce {
                                             let path = String::from_utf16_lossy(&buffer[..size as usize]);
                                             let path_lower = path.to_lowercase();
                                             
-                                            // 🛡️ TIER 1: Immutable OS Paths (UNCONDITIONAL ALLOW)
-                                            // Standard Users cannot write malware into these folders.
+                                            // 🛡️ TIER 1: Immutable OS Paths (ACL Trust)
                                             let is_core_os = path_lower == "c:\\windows\\explorer.exe" ||
                                                              path_lower.starts_with("c:\\windows\\system32\\") ||
                                                              path_lower.starts_with("c:\\windows\\syswow64\\") ||
                                                              path_lower.starts_with("c:\\windows\\systemapps\\") ||
                                                              path_lower.starts_with("c:\\windows\\immersivecontrolpanel\\") ||
-                                                             path_lower.starts_with("c:\\program files\\windowsapps\\");
+                                                             path_lower.starts_with("c:\\program files\\") ||
+                                                             path_lower.starts_with("c:\\program files (x86)\\");
 
-                                            if is_core_os {
+                                            if is_core_os && cfg.whitelist.contains(&name_lower) {
                                                 allow = true;
-                                                reason = "Core OS Component".to_string();
+                                                reason = "ACL Protected Directory + Whitelist".to_string();
                                             }
 
-                                            // 🛡️ TIER 2: Direct Whitelist Matches
-                                            if !allow && cfg.whitelist.contains(&name_lower) {
-                                                allow = true;
-                                                reason = "Explicit Whitelist".to_string();
-                                            }
-
-                                            // 🛡️ TIER 3: Trusted Path Heuristics
-                                            if !allow {
-                                                let trusted_paths = [
-                                                    "\\appdata\\local\\programs\\",
-                                                    "\\appdata\\roaming\\npm\\",
-                                                    "\\appdata\\local\\npm\\",
-                                                    "\\bravesoftware\\",
-                                                    "\\vscodium\\",
-                                                ];
-                                                if trusted_paths.iter().any(|tp| path_lower.contains(tp)) {
-                                                    allow = true;
-                                                    reason = "Trusted AppData Path".to_string();
-                                                }
-                                            }
-
-                                            // 🛡️ TIER 4: Cryptographic Publisher Verification
+                                            // 🛡️ TIER 2: User-Space Zero Trust (Cryptographic Verification)
+                                            // Explicitly removed all implicit AppData/Downloads trusts.
                                             if !allow && !cfg.trusted_publishers.is_empty() {
                                                 let subject_opt = if let Some(cached_subj) = signature_cache.get(&path_lower) {
                                                     Some(cached_subj.clone())
@@ -285,27 +264,20 @@ mod service_impl_enforce {
                                                     let subject_lower = subject.to_lowercase();
                                                     for pub_name in &cfg.trusted_publishers {
                                                         if subject_lower.contains(&pub_name.to_lowercase()) {
-                                                            allow = true; // Trusting Publisher implicitly allows the app!
-                                                            reason = format!("Trusted Publisher Verified: {}", pub_name);
                                                             
-                                                            if name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update") {
-                                                                is_ephemeral_installer = true;
+                                                            // Publisher is trusted. Must ALSO be whitelisted or an installer.
+                                                            if cfg.whitelist.contains(&name_lower) {
+                                                                allow = true;
+                                                                reason = format!("Trusted Publisher Verified: {}", pub_name);
+                                                                break;
                                                             }
-                                                            break;
+                                                            if name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update") {
+                                                                allow = true;
+                                                                is_ephemeral_installer = true;
+                                                                reason = format!("Verified Installer: {}", pub_name);
+                                                                break;
+                                                            }
                                                         }
-                                                    }
-                                                }
-                                            }
-                                            
-                                            // 🛡️ TIER 5: Heuristic Installer Matching
-                                            if !allow {
-                                                for w in &cfg.whitelist {
-                                                    if (name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update")) 
-                                                        && name_lower.contains(w) {
-                                                        allow = true;
-                                                        is_ephemeral_installer = true;
-                                                        reason = format!("Heuristic match: {}", w);
-                                                        break;
                                                     }
                                                 }
                                             }
@@ -740,33 +712,38 @@ mod service_impl_ipc {
                             if cmd_line.starts_with("elevate:") {
                                 let path = cmd_line.trim_start_matches("elevate:").trim();
                                 let name_lower = Path::new(path).file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                                let path_lower = path.to_lowercase();
                                 
                                 let mut allow = false;
                                 let mut reason = String::new();
                                 let cfg = cfg_handle.lock().unwrap().clone();
                                 
-                                if cfg.whitelist.contains(&name_lower) {
+                                // 🛡️ IPC Elevation TIER 1: Immutable OS Paths
+                                let is_protected_dir = path_lower.starts_with("c:\\windows\\") || 
+                                                       path_lower.starts_with("c:\\program files\\") || 
+                                                       path_lower.starts_with("c:\\program files (x86)\\");
+
+                                if is_protected_dir && cfg.whitelist.contains(&name_lower) {
                                     allow = true;
-                                    reason = format!("Explicit whitelist match: {}", name_lower);
-                                } else {
-                                    for w in &cfg.whitelist {
-                                        if (name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update")) 
-                                            && name_lower.contains(w) {
-                                            allow = true;
-                                            reason = format!("Heuristic whitelist match: {}", w);
-                                            break;
-                                        }
-                                    }
+                                    reason = "ACL Protected Directory + Whitelist".to_string();
                                 }
                                 
+                                // 🛡️ IPC Elevation TIER 2: Cryptographic Trust
                                 if !allow && !cfg.trusted_publishers.is_empty() {
                                     if let Some(subject) = get_authenticode_publisher(path) {
                                         let subject_lower = subject.to_lowercase();
                                         for pub_name in &cfg.trusted_publishers {
                                             if subject_lower.contains(&pub_name.to_lowercase()) {
-                                                allow = true;
-                                                reason = format!("Cryptographic Trust: {}", pub_name);
-                                                break;
+                                                if cfg.whitelist.contains(&name_lower) {
+                                                    allow = true;
+                                                    reason = format!("Trusted Publisher: {}", pub_name);
+                                                    break;
+                                                }
+                                                if name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update") {
+                                                    allow = true;
+                                                    reason = format!("Verified Installer: {}", pub_name);
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
@@ -1007,4 +984,4 @@ mod service_impl_updater {
             }
         }
     }
-        }
+}
