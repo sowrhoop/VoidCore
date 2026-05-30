@@ -49,7 +49,9 @@ fn main() {
             visuals.selection.bg_fill = egui::Color32::from_rgb(0, 150, 255); // Cyan accent
             cc.egui_ctx.set_visuals(visuals);
             
-            Ok(Box::new(VoidCoreApp::new()))
+            // FIXED: Removed the erroneous `Ok()` wrapper. 
+            // eframe 0.27 expects a raw Box<dyn App>, not a Result.
+            Box::new(VoidCoreApp::new())
         }),
     );
 
