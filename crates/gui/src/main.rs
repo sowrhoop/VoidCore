@@ -10,8 +10,21 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
 use chrono::{Local, TimeZone};
+use std::sync::Arc;
 use theme::{card_frame, page_title, section_title, Palette};
 use voidcore_shared::RuntimeConfig;
+
+fn load_app_icon() -> Arc<egui::IconData> {
+    let img = image::load_from_memory(include_bytes!("../assets/voidcore-icon.png"))
+        .expect("embedded VoidCore icon")
+        .into_rgba8();
+    let (width, height) = img.dimensions();
+    Arc::new(egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    })
+}
 
 fn show_error_msg(msg: &str) {
     unsafe {
@@ -40,7 +53,8 @@ fn main() {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([920.0, 620.0])
             .with_min_inner_size([760.0, 500.0])
-            .with_title("VoidCore Command Center"),
+            .with_title("VoidCore Command Center")
+            .with_icon(load_app_icon()),
         ..Default::default()
     };
 

@@ -11,23 +11,16 @@ pub fn header_bar(ui: &mut egui::Ui, p: &Palette, on_update: &mut bool) {
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.horizontal(|ui| {
-                    let logo_rect = ui
-                        .allocate_response(egui::vec2(36.0, 36.0), egui::Sense::hover())
-                        .rect;
-                    if ui.is_rect_visible(logo_rect) {
-                        ui.painter().rect_filled(
-                            logo_rect,
-                            egui::Rounding::same(8.0),
-                            p.accent_soft,
-                        );
-                        ui.painter().text(
-                            logo_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "VC",
-                            egui::FontId::proportional(13.0),
-                            p.text_primary,
-                        );
-                    }
+                    egui::Frame::none()
+                        .rounding(egui::Rounding::same(8.0))
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Image::new(egui::include_image!(
+                                    "../assets/voidcore-icon.png"
+                                ))
+                                .fit_to_exact_size(egui::vec2(40.0, 40.0)),
+                            );
+                        });
 
                     ui.add_space(12.0);
                     ui.vertical(|ui| {
