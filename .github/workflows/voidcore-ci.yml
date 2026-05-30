@@ -74,6 +74,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path tools/installer-builder/payloads
           Copy-Item target/release/voidcore-service.exe tools/installer-builder/payloads/
           Copy-Item target/release/voidcore-gui.exe tools/installer-builder/payloads/
+          Copy-Item target/release/*.dll tools/installer-builder/payloads/ -ErrorAction SilentlyContinue
 
       - name: Build Single EXE Installer
         run: cargo build -p installer-builder --release --features bundled
@@ -97,3 +98,4 @@ jobs:
             target/release/voidcore-service.exe.sig
             target/release/voidcore-gui.exe
             target/release/voidcore-gui.exe.sig
+            target/release/*.dll

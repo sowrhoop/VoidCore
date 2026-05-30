@@ -309,15 +309,13 @@ mod service_impl_enforce {
                                         let pid = trace.process_id;
                                         thread::Builder::new().name(format!("timebomb-{}", pid)).spawn(move || {
                                             thread::sleep(Duration::from_secs(15 * 60));
-                                            unsafe {
-                                                if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
-                                                    let mut code = 0;
-                                                    if GetExitCodeProcess(bomb_handle, &mut code).is_ok() && code == 259 {
-                                                        let _ = TerminateProcess(bomb_handle, 1);
-                                                        let _ = crate::logging::log_event("enforce", "BLOCK", "Timebomb detonated installer after 15m limit.");
-                                                    }
-                                                    let _ = windows::Win32::Foundation::CloseHandle(bomb_handle);
+                                            if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+                                                let mut code = 0;
+                                                if GetExitCodeProcess(bomb_handle, &mut code).is_ok() && code == 259 {
+                                                    let _ = TerminateProcess(bomb_handle, 1);
+                                                    let _ = crate::logging::log_event("enforce", "BLOCK", "Timebomb detonated installer after 15m limit.");
                                                 }
+                                                let _ = windows::Win32::Foundation::CloseHandle(bomb_handle);
                                             }
                                         }).ok();
                                     }

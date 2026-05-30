@@ -12,6 +12,11 @@ const SERVICE_EXE: &[u8] = include_bytes!("../payloads/voidcore-service.exe");
 #[cfg(feature = "bundled")]
 const GUI_EXE: &[u8] = include_bytes!("../payloads/voidcore-gui.exe");
 
+#[cfg(feature = "bundled")]
+mod embedded_dlls {
+    include!(concat!(env!("OUT_DIR"), "/embedded_dlls.rs"));
+}
+
 fn run_cmd(cmd: &mut Command) -> anyhow::Result<()> {
     let output = cmd.output()?;
     if !output.status.success() {
@@ -72,6 +77,10 @@ fn install_bundled() -> anyhow::Result<()> {
     // Drop EXEs
     fs::write(target_dir.join("voidcore-service.exe"), SERVICE_EXE)?;
     fs::write(target_dir.join("voidcore-gui.exe"), GUI_EXE)?;
+
+    for dll in embedded_dlls::EMBEDDED_DLLS {
+        fs::write(target_dir.join(dll.name), dll.bytes)?;
+    }
 
     // Drop Config with compile-time injected public key from CI env vars
     let mut cfg = voidcore_shared::RuntimeConfig::default();
