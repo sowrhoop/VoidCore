@@ -149,21 +149,19 @@ mod service_impl_enforce {
             
             let title = to_wide(title_str);
             let msg = to_wide(msg_str);
-            
-            // Strongly typed MessageBox response
             let mut response = MESSAGEBOX_RESULT(0);
             
             let _ = WTSSendMessageW(
                 HANDLE(0), // WTS_CURRENT_SERVER_HANDLE
-                0xFFFFFFFF, // Literal constant for WTS_ACTIVE_SESSION_ID
+                0xFFFFFFFF, // WTS_ACTIVE_SESSION_ID
                 PCWSTR(title.as_ptr()),
                 (title.len() * 2) as u32,
                 PCWSTR(msg.as_ptr()),
                 (msg.len() * 2) as u32,
-                MESSAGEBOX_STYLE(0x00000030), // MB_ICONEXCLAMATION strongly typed
+                MESSAGEBOX_STYLE(0x00000030), // MB_ICONEXCLAMATION
                 5, // Timeout
                 &mut response,
-                windows::Win32::Foundation::BOOL(0), // Don't wait for user response
+                windows::Win32::Foundation::BOOL(0), // Wait = false
             );
         }
     }
@@ -307,7 +305,7 @@ mod service_impl_enforce {
                                             .name(format!("timebomb-{}", pid))
                                             .spawn(move || {
                                                 thread::sleep(Duration::from_secs(15 * 60));
-                                                // Removed redundant unsafe block here to fix compiler warning
+                                                // Removed redundant nested unsafe block
                                                 if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
                                                     let _ = TerminateProcess(bomb_handle, 1);
                                                     let _ = windows::Win32::Foundation::CloseHandle(bomb_handle);
@@ -454,19 +452,21 @@ mod service_impl_enforce {
     }
 
     fn write_chromium_policies(blocklist: &std::collections::HashSet<String>) {
+        // Tuples: Base Key, Blocklist, Allowlist, Ext Block, Ext Allow, Internal Settings Scheme
         let browsers = [
-            ("SOFTWARE\\Policies\\Google\\Chrome", "SOFTWARE\\Policies\\Google\\Chrome\\URLBlocklist", "SOFTWARE\\Policies\\Google\\Chrome\\ExtensionInstallBlocklist", "SOFTWARE\\Policies\\Google\\Chrome\\ExtensionInstallAllowlist"),
-            ("SOFTWARE\\Policies\\BraveSoftware\\Brave", "SOFTWARE\\Policies\\BraveSoftware\\Brave\\URLBlocklist", "SOFTWARE\\Policies\\BraveSoftware\\Brave\\ExtensionInstallBlocklist", "SOFTWARE\\Policies\\BraveSoftware\\Brave\\ExtensionInstallAllowlist"),
-            ("SOFTWARE\\Policies\\Microsoft\\Edge", "SOFTWARE\\Policies\\Microsoft\\Edge\\URLBlocklist", "SOFTWARE\\Policies\\Microsoft\\Edge\\ExtensionInstallBlocklist", "SOFTWARE\\Policies\\Microsoft\\Edge\\ExtensionInstallAllowlist"),
+            ("SOFTWARE\\Policies\\Google\\Chrome", "SOFTWARE\\Policies\\Google\\Chrome\\URLBlocklist", "SOFTWARE\\Policies\\Google\\Chrome\\URLAllowlist", "SOFTWARE\\Policies\\Google\\Chrome\\ExtensionInstallBlocklist", "SOFTWARE\\Policies\\Google\\Chrome\\ExtensionInstallAllowlist", "chrome://*"),
+            ("SOFTWARE\\Policies\\BraveSoftware\\Brave", "SOFTWARE\\Policies\\BraveSoftware\\Brave\\URLBlocklist", "SOFTWARE\\Policies\\BraveSoftware\\Brave\\URLAllowlist", "SOFTWARE\\Policies\\BraveSoftware\\Brave\\ExtensionInstallBlocklist", "SOFTWARE\\Policies\\BraveSoftware\\Brave\\ExtensionInstallAllowlist", "brave://*"),
+            ("SOFTWARE\\Policies\\Microsoft\\Edge", "SOFTWARE\\Policies\\Microsoft\\Edge\\URLBlocklist", "SOFTWARE\\Policies\\Microsoft\\Edge\\URLAllowlist", "SOFTWARE\\Policies\\Microsoft\\Edge\\ExtensionInstallBlocklist", "SOFTWARE\\Policies\\Microsoft\\Edge\\ExtensionInstallAllowlist", "edge://*"),
         ];
 
         unsafe {
-            for (base_path, bl_path, ext_block_path, ext_allow_path) in &browsers {
+            for (base_path, bl_path, al_path, ext_block_path, ext_allow_path, internal_scheme) in &browsers {
                 let base_w = to_wide(*base_path);
                 let mut hkey = Default::default();
                 
                 if RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(base_w.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey, None).is_ok() {
-                    let incognito_val: u32 = 2; // 2 = disabled
+                    // 1 is Disabled. (2 was Forced - which caused the bug!)
+                    let incognito_val: u32 = 1; 
                     let inc_name = to_wide("IncognitoModeAvailability");
                     let _ = RegSetValueExW(hkey, PCWSTR(inc_name.as_ptr()), 0, REG_DWORD, Some(std::slice::from_raw_parts(&incognito_val as *const _ as *const u8, 4)));
 
@@ -485,10 +485,22 @@ mod service_impl_enforce {
                 if RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(bl_w.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey_block, None).is_ok() {
                     for (index, domain) in blocklist.iter().enumerate() {
                         let val_num_w = to_wide(&(index + 1).to_string());
-                        let pattern_w = to_wide(&format!("*{}*", domain));
+                        // Removed the asterisks here. Standard domain format handles subdomains automatically!
+                        let pattern_w = to_wide(domain);
                         let pattern_bytes = std::slice::from_raw_parts(pattern_w.as_ptr() as *const u8, pattern_w.len() * 2);
                         let _ = RegSetValueExW(hkey_block, PCWSTR(val_num_w.as_ptr()), 0, REG_SZ, Some(pattern_bytes));
                     }
+                }
+
+                // Explicitly ALLOW the browser's settings page so you don't get locked out
+                let al_w = to_wide(*al_path);
+                let _ = RegDeleteTreeW(HKEY_LOCAL_MACHINE, PCWSTR(al_w.as_ptr()));
+                let mut hkey_allow = Default::default();
+                if RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(al_w.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey_allow, None).is_ok() {
+                    let val_num_w = to_wide("1");
+                    let pattern_w = to_wide(*internal_scheme);
+                    let pattern_bytes = std::slice::from_raw_parts(pattern_w.as_ptr() as *const u8, pattern_w.len() * 2);
+                    let _ = RegSetValueExW(hkey_allow, PCWSTR(val_num_w.as_ptr()), 0, REG_SZ, Some(pattern_bytes));
                 }
 
                 let ext_blk_w = to_wide(*ext_block_path);
@@ -505,10 +517,17 @@ mod service_impl_enforce {
                 let _ = RegDeleteTreeW(HKEY_LOCAL_MACHINE, PCWSTR(ext_alw_w.as_ptr()));
                 let mut hkey_ext_allow = Default::default();
                 if RegCreateKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(ext_alw_w.as_ptr()), 0, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut hkey_ext_allow, None).is_ok() {
-                    let val_num_w = to_wide("1");
-                    let pattern_w = to_wide("nngceckbapebfimnlniiiahkandclblb"); // Bitwarden
-                    let pattern_bytes = std::slice::from_raw_parts(pattern_w.as_ptr() as *const u8, pattern_w.len() * 2);
-                    let _ = RegSetValueExW(hkey_ext_allow, PCWSTR(val_num_w.as_ptr()), 0, REG_SZ, Some(pattern_bytes));
+                    // Chrome/Brave Bitwarden ID
+                    let val_num_w_1 = to_wide("1");
+                    let pattern_w_1 = to_wide("nngceckbapebfimnlniiiahkandclblb"); 
+                    let pattern_bytes_1 = std::slice::from_raw_parts(pattern_w_1.as_ptr() as *const u8, pattern_w_1.len() * 2);
+                    let _ = RegSetValueExW(hkey_ext_allow, PCWSTR(val_num_w_1.as_ptr()), 0, REG_SZ, Some(pattern_bytes_1));
+
+                    // Edge Bitwarden ID
+                    let val_num_w_2 = to_wide("2");
+                    let pattern_w_2 = to_wide("jbkfoedolllekgbhcbcoahefnbanhhlh"); 
+                    let pattern_bytes_2 = std::slice::from_raw_parts(pattern_w_2.as_ptr() as *const u8, pattern_w_2.len() * 2);
+                    let _ = RegSetValueExW(hkey_ext_allow, PCWSTR(val_num_w_2.as_ptr()), 0, REG_SZ, Some(pattern_bytes_2));
                 }
             }
         }

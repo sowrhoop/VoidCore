@@ -23,22 +23,17 @@ pub struct RuntimeConfig {
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
-        // We use option_env! to read GitHub Secrets during the CI/CD build.
-        // If they are missing (e.g., local development), it falls back to defaults.
         let whitelist_raw = option_env!("APP_WHITELIST").unwrap_or("code,docker,python,wt,msedge,cursor,brave,vscodium");
         let blocklist_raw = option_env!("URL_BLOCKLIST").unwrap_or("reddit.com,twitter.com,x.com,instagram.com,facebook.com,tiktok.com,youtube.com,twitch.tv,netflix.com,9gag.com,discord.com");
-        let publishers_raw = option_env!("TRUSTED_PUBLISHERS").unwrap_or("Brave Software, Inc.,Microsoft Corporation,GitHub, Inc.,Discord Inc.");
+        let publishers_raw = option_env!("TRUSTED_PUBLISHERS").unwrap_or("Microsoft Corporation,Brave Software,Docker Inc,Python Software Foundation,OpenJS Foundation,Postman,WireGuard,Martin Prikryl,Igor Pavlov,Intel Corporation,Johannes Schindelin,GitHub");
         
         Self {
             whitelist: whitelist_raw.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect(),
             url_blocklist: blocklist_raw.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect(),
             trusted_publishers: publishers_raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
             
-            github_repo: "sowrhoop/VoidCore".to_string(), // You can also put this in a secret if desired
-            
-            // This is still passed via env dynamically in the installer
+            github_repo: "sowrhoop/VoidCore".to_string(),
             pubkey_hex: option_env!("VOIDCORE_PUBKEY").unwrap_or("0000000000000000000000000000000000000000000000000000000000000000").to_string(),
-            
             version_code: binary_version(),
         }
     }
