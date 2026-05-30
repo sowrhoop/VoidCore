@@ -211,6 +211,22 @@ mod service_impl_enforce {
                             let junk = ["steam", "epicgameslauncher", "xboxapp", "gamebar", "riotclient"];
                             let is_junk = junk.iter().any(|j| name_lower.contains(j));
 
+                            if !is_junk {
+                                if cfg.whitelist.contains(&name_lower) {
+                                    allow = true;
+                                } else {
+                                    for w in &cfg.whitelist {
+                                        if (name_lower.contains("setup") || name_lower.contains("install") || name_lower.contains("update")) 
+                                            && name_lower.contains(w) {
+                                            allow = true;
+                                            is_ephemeral_installer = true;
+                                            reason = format!("Heuristic match: {}", w);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
                             unsafe {
                                 if let Ok(proc_handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, false, trace.process_id) {
                                     
@@ -220,7 +236,7 @@ mod service_impl_enforce {
                                         continue; 
                                     }
 
-                                    if !is_junk {
+                                    if !allow && !is_junk {
                                         let mut buffer = [0u16; 1024];
                                         let mut size = buffer.len() as u32;
                                         
@@ -292,15 +308,14 @@ mod service_impl_enforce {
                                         let pid = trace.process_id;
                                         thread::Builder::new().name(format!("timebomb-{}", pid)).spawn(move || {
                                             thread::sleep(Duration::from_secs(15 * 60));
-                                            unsafe {
-                                                if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
-                                                    let mut code = 0;
-                                                    if GetExitCodeProcess(bomb_handle, &mut code).is_ok() && code == 259 {
-                                                        let _ = TerminateProcess(bomb_handle, 1);
-                                                        let _ = crate::logging::log_event("enforce", "BLOCK", "Timebomb detonated installer after 15m limit.");
-                                                    }
-                                                    let _ = windows::Win32::Foundation::CloseHandle(bomb_handle);
+                                            // Redundant unsafe block removed
+                                            if let Ok(bomb_handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+                                                let mut code = 0;
+                                                if GetExitCodeProcess(bomb_handle, &mut code).is_ok() && code == 259 {
+                                                    let _ = TerminateProcess(bomb_handle, 1);
+                                                    let _ = crate::logging::log_event("enforce", "BLOCK", "Timebomb detonated installer after 15m limit.");
                                                 }
+                                                let _ = windows::Win32::Foundation::CloseHandle(bomb_handle);
                                             }
                                         }).ok();
                                     }
@@ -318,7 +333,7 @@ mod service_impl_enforce {
             .name("main-enforce".into())
             .spawn(move || {
                 loop {
-                    rotate_local_admin_password();
+                    rotate_local_admin_password(&cfg_handle_main);
                     
                     let cfg = cfg_handle_main.lock().map(|c| c.clone()).unwrap_or_default();
                     enforce_global_mullvad_dns();
@@ -398,11 +413,15 @@ mod service_impl_enforce {
         let _ = std::process::Command::new("powershell").args(["-NoProfile","-NonInteractive","-WindowStyle","Hidden","-Command", ps]).output();
     }
 
-    fn rotate_local_admin_password() {
+    fn rotate_local_admin_password(cfg_handle: &std::sync::Arc<std::sync::Mutex<RuntimeConfig>>) {
         use rand::Rng;
         const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+[]{}|;:,.<>?/";
         let mut rng = rand::thread_rng();
         let pass: String = (0..127).map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char).collect();
+
+        if let Ok(mut cfg) = cfg_handle.lock() {
+            cfg.current_admin_password = Some(pass.clone());
+        }
 
         let user_w = to_wide("VoidCoreAdmin");
         let mut pass_w = to_wide(&pass);
@@ -727,9 +746,6 @@ mod service_impl_ipc {
                                 }
                                 
                                 if allow {
-                                    // 🚀 ADVANCED ELEVATION: SYSTEM Token Duplication
-                                    // Instead of logging in as VoidCoreAdmin (which triggers UAC and blocks AppData),
-                                    // we duplicate the Daemon's SYSTEM token and inject it into the active user session!
                                     let session_id = WTSGetActiveConsoleSessionId();
                                     
                                     if session_id == 0xFFFFFFFF {
@@ -739,16 +755,16 @@ mod service_impl_ipc {
                                         if OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut sys_token).is_ok() {
                                             
                                             let mut dup_token = HANDLE(0);
+                                            // FIXED: Passing TOKEN_ALL_ACCESS directly as TOKEN_ACCESS_MASK
                                             if DuplicateTokenEx(
                                                 sys_token,
-                                                TOKEN_ALL_ACCESS.0,
+                                                TOKEN_ALL_ACCESS,
                                                 None,
                                                 SecurityImpersonation,
                                                 TokenPrimary,
                                                 &mut dup_token
                                             ).is_ok() {
                                                 
-                                                // Mount the SYSTEM token into the visual user session
                                                 let _ = SetTokenInformation(
                                                     dup_token,
                                                     TokenSessionId,
