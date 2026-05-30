@@ -1,4 +1,7 @@
-#![windows_subsystem = "windows"] // Launch without a console window
+#![windows_subsystem = "windows"]
+
+mod theme;
+mod ui;
 
 use eframe::egui;
 use std::ffi::OsStr;
@@ -6,17 +9,23 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
-use chrono::{TimeZone, Local};
+use chrono::{Local, TimeZone};
+use theme::{card_frame, page_title, section_title, Palette};
 use voidcore_shared::RuntimeConfig;
 
 fn show_error_msg(msg: &str) {
     unsafe {
-        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_OK, MB_ICONERROR};
-        use windows::core::{PCWSTR, HSTRING};
-        
+        use windows::core::{HSTRING, PCWSTR};
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
         let title = HSTRING::from("VoidCore Diagnostics");
         let body = HSTRING::from(msg);
-        let _ = MessageBoxW(None, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
+        let _ = MessageBoxW(
+            None,
+            PCWSTR(body.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
     }
 }
 
@@ -29,8 +38,8 @@ fn main() {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([800.0, 550.0])
-            .with_min_inner_size([700.0, 450.0])
+            .with_inner_size([920.0, 620.0])
+            .with_min_inner_size([760.0, 500.0])
             .with_title("VoidCore Command Center"),
         ..Default::default()
     };
@@ -39,19 +48,16 @@ fn main() {
         "VoidCore Dashboard",
         options,
         Box::new(|cc| {
-            let mut visuals = egui::Visuals::dark();
-            visuals.window_rounding = 10.0.into();
-            visuals.panel_fill = egui::Color32::from_rgb(14, 16, 20);
-            visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(26, 28, 34);
-            visuals.selection.bg_fill = egui::Color32::from_rgb(0, 160, 255);
-            cc.egui_ctx.set_visuals(visuals);
-            
+            theme::apply_theme(&cc.egui_ctx);
             Box::new(VoidCoreApp::new())
         }),
     );
 
     if let Err(e) = result {
-        let err_msg = format!("The VoidCore graphics engine failed to initialize.\n\nTechnical Details:\n{}", e);
+        let err_msg = format!(
+            "The VoidCore graphics engine failed to initialize.\n\nTechnical Details:\n{}",
+            e
+        );
         show_error_msg(&err_msg);
     }
 }
@@ -67,12 +73,14 @@ struct VoidCoreApp {
     daemon_status: String,
     daemon_version: String,
     update_message: Option<String>,
+    update_message_ok: bool,
     elevate_path: String,
     config: RuntimeConfig,
     logs: Vec<LogEntry>,
+    last_status_refresh: f64,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 enum Tab {
     Overview,
     Enforcements,
@@ -80,10 +88,30 @@ enum Tab {
     Logs,
 }
 
+impl Tab {
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Overview => "Overview",
+            Tab::Enforcements => "Policies",
+            Tab::Launchpad => "Launchpad",
+            Tab::Logs => "Audit Logs",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Tab::Overview => "◆",
+            Tab::Enforcements => "◇",
+            Tab::Launchpad => "▶",
+            Tab::Logs => "≡",
+        }
+    }
+}
+
 impl VoidCoreApp {
     fn new() -> Self {
         let (status, version) = fetch_daemon_status();
-        
+
         let config = fs::read_to_string(r"C:\ProgramData\VoidCore\config.json")
             .ok()
             .and_then(|s| serde_json::from_str::<RuntimeConfig>(&s).ok())
@@ -94,11 +122,13 @@ impl VoidCoreApp {
             daemon_status: status,
             daemon_version: version,
             update_message: None,
+            update_message_ok: true,
             elevate_path: String::new(),
             config,
             logs: vec![],
+            last_status_refresh: 0.0,
         };
-        
+
         app.reload_logs();
         app
     }
@@ -113,7 +143,11 @@ impl VoidCoreApp {
                         if let chrono::LocalResult::Single(dt) = Local.timestamp_opt(timestamp, 0) {
                             self.logs.push(LogEntry {
                                 time: dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-                                action: parts[1].replace("[", "").replace("]", "").trim().to_string(),
+                                action: parts[1]
+                                    .replace('[', "")
+                                    .replace(']', "")
+                                    .trim()
+                                    .to_string(),
                                 message: parts[2].trim().to_string(),
                             });
                         }
@@ -122,12 +156,22 @@ impl VoidCoreApp {
             }
         }
     }
+
+    fn refresh_daemon_status(&mut self) {
+        let (status, version) = fetch_daemon_status();
+        self.daemon_status = status;
+        self.daemon_version = version;
+    }
+
+    fn daemon_running(&self) -> bool {
+        self.daemon_status == "running"
+    }
 }
 
 impl eframe::App for VoidCoreApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        
-        // Handle Drag-and-Drop globally
+        let p = Palette::default();
+
         if !ctx.input(|i| i.raw.dropped_files.is_empty()) {
             if let Some(file) = ctx.input(|i| i.raw.dropped_files.first().cloned()) {
                 if let Some(path) = file.path {
@@ -137,216 +181,435 @@ impl eframe::App for VoidCoreApp {
             }
         }
 
-        // TOP HEADER
-        egui::TopBottomPanel::top("top_panel").frame(
-            egui::Frame::none().fill(egui::Color32::from_rgb(20, 22, 28)).inner_margin(12.0)
-        ).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading(egui::RichText::new("🛡 VoidCore").strong().size(22.0).color(egui::Color32::WHITE));
-                ui.label(egui::RichText::new("Zero-Trust Architecture").size(14.0).color(egui::Color32::GRAY));
-                
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let btn = ui.add(egui::Button::new(egui::RichText::new("⟳ Check for Updates").size(13.0)).fill(egui::Color32::from_rgb(0, 100, 180)));
-                    if btn.clicked() {
-                        self.update_message = Some(send_update_command());
+        let now = ctx.input(|i| i.time);
+        if now - self.last_status_refresh > 5.0 {
+            self.refresh_daemon_status();
+            self.last_status_refresh = now;
+            ctx.request_repaint_after(std::time::Duration::from_secs(5));
+        }
+
+        egui::TopBottomPanel::top("top_panel")
+            .frame(egui::Frame::none().fill(p.bg_app))
+            .show(ctx, |ui| {
+                let mut trigger_update = false;
+                ui::header_bar(ui, &p, &mut trigger_update);
+                if trigger_update {
+                    let msg = send_update_command();
+                    self.update_message_ok = !msg.contains("Failed");
+                    self.update_message = Some(msg);
+                }
+                if let Some(msg) = &self.update_message {
+                    ui.add_space(8.0);
+                    ui::toast_banner(ui, &p, msg, self.update_message_ok);
+                    ui.add_space(4.0);
+                }
+            });
+
+        egui::SidePanel::left("side_panel")
+            .frame(
+                egui::Frame::none()
+                    .fill(p.bg_sidebar)
+                    .stroke(egui::Stroke::new(1.0, p.border_subtle)),
+            )
+            .exact_width(200.0)
+            .show(ctx, |ui| {
+                ui.add_space(16.0);
+                ui.label(
+                    egui::RichText::new("NAVIGATION")
+                        .size(11.0)
+                        .color(p.text_muted),
+                );
+                ui.add_space(12.0);
+
+                for tab in [
+                    Tab::Overview,
+                    Tab::Enforcements,
+                    Tab::Launchpad,
+                    Tab::Logs,
+                ] {
+                    let selected = self.selected_tab == tab;
+                    if ui::nav_item(ui, &p, tab.label(), tab.icon(), selected).clicked() {
+                        self.selected_tab = tab;
+                        if tab == Tab::Logs {
+                            self.reload_logs();
+                        }
                     }
+                    ui.add_space(4.0);
+                }
+
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    ui.add_space(16.0);
+                    ui.label(theme::muted_text(&format!(
+                        "Engine v1.0.{}",
+                        self.daemon_version
+                    )));
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Zero-Trust")
+                            .size(11.0)
+                            .italics()
+                            .color(p.text_muted),
+                    );
                 });
             });
-            
-            if let Some(msg) = &self.update_message {
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new(msg).strong().color(egui::Color32::from_rgb(0, 200, 100)));
-            }
-        });
 
-        // SIDE NAVIGATION
-        egui::SidePanel::left("side_panel").frame(
-            egui::Frame::none().fill(egui::Color32::from_rgb(18, 20, 24)).inner_margin(16.0)
-        ).exact_width(160.0).show(ctx, |ui| {
-            ui.style_mut().spacing.item_spacing.y = 12.0;
-            
-            ui.selectable_value(&mut self.selected_tab, Tab::Overview, egui::RichText::new("📊 Overview").size(16.0));
-            ui.selectable_value(&mut self.selected_tab, Tab::Enforcements, egui::RichText::new("🔒 Policies").size(16.0));
-            ui.selectable_value(&mut self.selected_tab, Tab::Launchpad, egui::RichText::new("🚀 Launchpad").size(16.0));
-            
-            if ui.selectable_value(&mut self.selected_tab, Tab::Logs, egui::RichText::new("📝 Audit Logs").size(16.0)).clicked() {
-                self.reload_logs();
-            }
-        });
-
-        // MAIN CONTENT AREA
-        egui::CentralPanel::default().frame(
-            egui::Frame::none().fill(egui::Color32::from_rgb(14, 16, 20)).inner_margin(24.0)
-        ).show(ctx, |ui| {
-            
-            match self.selected_tab {
-                Tab::Overview => {
-                    ui.heading(egui::RichText::new("System Status").size(24.0).strong().color(egui::Color32::WHITE));
-                    ui.add_space(20.0);
-                    
-                    let card_frame = egui::Frame::none()
-                        .fill(egui::Color32::from_rgb(26, 28, 34))
-                        .rounding(8.0)
-                        .inner_margin(20.0);
-                    
-                    card_frame.show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        
-                        let status_color = if self.daemon_status == "running" {
-                            egui::Color32::from_rgb(50, 255, 120)
-                        } else {
-                            egui::Color32::from_rgb(255, 80, 80)
-                        };
-
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Daemon State:").strong().size(18.0).color(egui::Color32::LIGHT_GRAY));
-                            ui.label(egui::RichText::new(self.daemon_status.to_uppercase()).strong().size(18.0).color(status_color));
-                        });
-                        
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Engine Version:").strong().size(16.0).color(egui::Color32::LIGHT_GRAY));
-                            ui.label(egui::RichText::new(format!("v1.0.{}", self.daemon_version)).size(16.0).color(egui::Color32::WHITE));
-                        });
-                        
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Architecture:").strong().size(16.0).color(egui::Color32::LIGHT_GRAY));
-                            ui.label(egui::RichText::new("Zero-Trust (NT AUTHORITY\\SYSTEM)").size(16.0).color(egui::Color32::from_rgb(200, 200, 200)));
-                        });
-                    });
-
-                    ui.add_space(40.0);
-                    ui.label(egui::RichText::new("The machine is fully secured. Safe mode is destroyed. Administrators have been purged. You are locked in.").italics().size(14.0).color(egui::Color32::GRAY));
-                },
-                Tab::Enforcements => {
-                    ui.heading(egui::RichText::new("Active Security Constraints").size(24.0).strong().color(egui::Color32::WHITE));
-                    ui.add_space(20.0);
-                    
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        let policy_frame = egui::Frame::none().fill(egui::Color32::from_rgb(26, 28, 34)).rounding(8.0).inner_margin(16.0);
-
-                        policy_frame.show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.label(egui::RichText::new("🌐 Network Layer").strong().size(16.0).color(egui::Color32::from_rgb(0, 180, 255)));
-                            ui.add_space(8.0);
-                            ui.label("✔ OS DNS locked to Mullvad Ad/Tracker/Malware filter.");
-                            ui.label("✔ Chromium DNS-over-HTTPS cryptographically forced.");
-                            ui.label(format!("✔ Firewall Outbound Drops dynamically active for {} domains.", self.config.url_blocklist.len()));
-                        });
-                        ui.add_space(15.0);
-
-                        policy_frame.show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.label(egui::RichText::new("🔒 Application Layer").strong().size(16.0).color(egui::Color32::from_rgb(0, 180, 255)));
-                            ui.add_space(8.0);
-                            ui.label("✔ Incognito and InPrivate Browsing completely disabled.");
-                            ui.label("✔ Chromium Extensions blocked universally (Asterisk rule).");
-                            ui.label("✔ Bitwarden explicitly allowed in ExtensionInstallAllowlist.");
-                        });
-                        ui.add_space(15.0);
-
-                        policy_frame.show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.label(egui::RichText::new("🛡 Execution Layer").strong().size(16.0).color(egui::Color32::from_rgb(0, 180, 255)));
-                            ui.add_space(8.0);
-                            ui.label(format!("✔ Whitelist strict enforcement active ({} explicit apps).", self.config.whitelist.len()));
-                            ui.label(format!("✔ Authenticode validation active ({} trusted publishers).", self.config.trusted_publishers.len()));
-                            ui.label("✔ 15-Minute Timebomb heuristic active on verified installers.");
-                        });
-                    });
-                },
-                Tab::Launchpad => {
-                    ui.heading(egui::RichText::new("Secure Elevation Broker").size(24.0).strong().color(egui::Color32::WHITE));
-                    ui.add_space(20.0);
-                    
-                    ui.label(egui::RichText::new(
-                        "Some whitelisted applications (like installers or flashing tools) require Administrator privileges to run. \
-                        Because your account is locked down, Windows UAC will normally block them.\n\n\
-                        Paste the path to the executable below. If it is from a Trusted Publisher, the VoidCore daemon will dynamically generate a privileged \
-                        environment and launch the application directly on your desktop."
-                    ).size(14.0).color(egui::Color32::LIGHT_GRAY));
-                    
-                    ui.add_space(30.0);
-                    
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Executable Path:").strong().size(14.0));
-                        ui.add(egui::TextEdit::singleline(&mut self.elevate_path).desired_width(450.0).margin(egui::vec2(8.0, 8.0)));
-                    });
-                    
-                    ui.add_space(20.0);
-                    
-                    if ui.button(egui::RichText::new("⚡ Launch Elevated").size(16.0)).clicked() {
-                        self.update_message = Some(send_elevate_command(&self.elevate_path));
-                    }
-                    
-                    ui.add_space(40.0);
-                    ui.label(egui::RichText::new("💡 Tip: You can drag and drop an .exe file anywhere onto this window to auto-fill the path.").italics().color(egui::Color32::from_rgb(100, 150, 200)));
-                },
-                Tab::Logs => {
-                    ui.horizontal(|ui| {
-                        ui.heading(egui::RichText::new("Execution Audit Logs").size(24.0).strong().color(egui::Color32::WHITE));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("↻ Refresh").clicked() {
-                                self.reload_logs();
-                            }
-                        });
-                    });
-                    ui.add_space(20.0);
-                    
-                    let table_frame = egui::Frame::none().fill(egui::Color32::from_rgb(22, 24, 28)).rounding(6.0).inner_margin(8.0);
-                    table_frame.show(ui, |ui| {
-                        egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-                            egui::Grid::new("logs_grid").striped(true).min_col_width(140.0).spacing([20.0, 8.0]).show(ui, |ui| {
-                                ui.label(egui::RichText::new("Timestamp").strong().color(egui::Color32::LIGHT_GRAY));
-                                ui.label(egui::RichText::new("Action").strong().color(egui::Color32::LIGHT_GRAY));
-                                ui.label(egui::RichText::new("Details").strong().color(egui::Color32::LIGHT_GRAY));
-                                ui.end_row();
-
-                                if self.logs.is_empty() {
-                                    ui.label(egui::RichText::new("No entries.").italics());
-                                    ui.end_row();
-                                }
-
-                                for log in &self.logs {
-                                    let action_color = match log.action.as_str() {
-                                        "BLOCK" => egui::Color32::from_rgb(255, 80, 80),
-                                        "ALLOW" => egui::Color32::from_rgb(80, 255, 120),
-                                        _ => egui::Color32::LIGHT_GRAY,
-                                    };
-
-                                    ui.label(egui::RichText::new(&log.time).size(13.0).color(egui::Color32::GRAY));
-                                    ui.label(egui::RichText::new(&log.action).strong().size(13.0).color(action_color));
-                                    ui.label(egui::RichText::new(&log.message).size(13.0).color(egui::Color32::WHITE));
-                                    ui.end_row();
-                                }
-                            });
-                        });
-                    });
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(p.bg_app)
+                    .inner_margin(egui::Margin::symmetric(28.0, 24.0)),
+            )
+            .show(ctx, |ui| {
+                match self.selected_tab {
+                    Tab::Overview => self.show_overview(ui, &p),
+                    Tab::Enforcements => self.show_enforcements(ui, &p),
+                    Tab::Launchpad => self.show_launchpad(ui, &p),
+                    Tab::Logs => self.show_logs(ui, &p),
                 }
-            }
-        });
+            });
     }
 }
 
+impl VoidCoreApp {
+    fn show_overview(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        ui.horizontal(|ui| {
+            ui.label(page_title("System Status"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui::secondary_button(ui, p, "Refresh").clicked() {
+                    self.refresh_daemon_status();
+                }
+            });
+        });
+        ui.add_space(6.0);
+        ui.label(theme::muted_text(
+            "Live connection to the VoidCore background service.",
+        ));
+        ui.add_space(24.0);
+
+        ui.horizontal(|ui| {
+            let card_w = (ui.available_width() - 16.0) / 2.0;
+
+            card_frame(p).show(ui, |ui| {
+                ui.set_width(card_w);
+                ui.label(section_title("Daemon"));
+                ui.add_space(14.0);
+                ui::status_pill(
+                    ui,
+                    p,
+                    &self.daemon_status.to_uppercase(),
+                    self.daemon_running(),
+                );
+                ui.add_space(16.0);
+                ui::stat_row(
+                    ui,
+                    p,
+                    "Engine version",
+                    &format!("v1.0.{}", self.daemon_version),
+                    p.text_primary,
+                );
+                ui::stat_row(
+                    ui,
+                    p,
+                    "Privilege model",
+                    "NT AUTHORITY\\SYSTEM",
+                    p.text_secondary,
+                );
+            });
+
+            ui.add_space(16.0);
+
+            card_frame(p).show(ui, |ui| {
+                ui.set_width(card_w);
+                ui.label(section_title("Protection Summary"));
+                ui.add_space(14.0);
+                ui::stat_row(
+                    ui,
+                    p,
+                    "Whitelisted apps",
+                    &self.config.whitelist.len().to_string(),
+                    p.accent,
+                );
+                ui::stat_row(
+                    ui,
+                    p,
+                    "Blocked domains",
+                    &self.config.url_blocklist.len().to_string(),
+                    p.accent,
+                );
+                ui::stat_row(
+                    ui,
+                    p,
+                    "Trusted publishers",
+                    &self.config.trusted_publishers.len().to_string(),
+                    p.accent,
+                );
+            });
+        });
+
+        ui.add_space(20.0);
+
+        card_frame(p).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("●")
+                        .color(if self.daemon_running() {
+                            p.success
+                        } else {
+                            p.warning
+                        }),
+                );
+                ui.label(theme::body_text(
+                    if self.daemon_running() {
+                        "The machine is under active Zero-Trust enforcement. Safe mode is disabled, \
+                         administrative surfaces are restricted, and execution policy is enforced by the daemon."
+                    } else {
+                        "The daemon is not reachable. Enforcement may be offline — verify the VoidCore \
+                         Windows service is running."
+                    },
+                ));
+            });
+        });
+    }
+
+    fn show_enforcements(&self, ui: &mut egui::Ui, p: &Palette) {
+        ui.label(page_title("Security Policies"));
+        ui.add_space(6.0);
+        ui.label(theme::muted_text(
+            "Active constraints applied by the VoidCore engine.",
+        ));
+        ui.add_space(20.0);
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                policy_card(ui, p, "Network Layer", |ui, p| {
+                    ui::policy_bullet(ui, p, "OS DNS locked to Mullvad Ad/Tracker/Malware filter.");
+                    ui::policy_bullet(
+                        ui,
+                        p,
+                        "Chromium DNS-over-HTTPS cryptographically forced.",
+                    );
+                    ui::policy_bullet(
+                        ui,
+                        p,
+                        &format!(
+                            "Firewall outbound drops active for {} blocked domains.",
+                            self.config.url_blocklist.len()
+                        ),
+                    );
+                });
+
+                ui.add_space(12.0);
+
+                policy_card(ui, p, "Application Layer", |ui, p| {
+                    ui::policy_bullet(ui, p, "Incognito and InPrivate browsing disabled.");
+                    ui::policy_bullet(
+                        ui,
+                        p,
+                        "Chromium extensions blocked globally (wildcard rule).",
+                    );
+                    ui::policy_bullet(
+                        ui,
+                        p,
+                        "Bitwarden allowed via ExtensionInstallAllowlist.",
+                    );
+                });
+
+                ui.add_space(12.0);
+
+                policy_card(ui, p, "Execution Layer", |ui, p| {
+                    ui::policy_bullet(
+                        ui,
+                        p,
+                        &format!(
+                            "Whitelist enforcement ({} explicit applications).",
+                            self.config.whitelist.len()
+                        ),
+                    );
+                    ui::policy_bullet(
+                        ui,
+                        p,
+                        &format!(
+                            "Authenticode validation ({} trusted publishers).",
+                            self.config.trusted_publishers.len()
+                        ),
+                    );
+                    ui::policy_bullet(
+                        ui,
+                        p,
+                        "15-minute timebomb heuristic on verified installers.",
+                    );
+                });
+            });
+    }
+
+    fn show_launchpad(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        ui.label(page_title("Secure Elevation"));
+        ui.add_space(6.0);
+        ui.label(theme::body_text(
+            "Whitelisted installers and tools may need Administrator rights. UAC would normally block them \
+             on a locked-down account. Provide a path from a trusted publisher and the daemon will launch \
+             it in a privileged desktop session.",
+        ));
+        ui.add_space(24.0);
+
+        card_frame(p).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(section_title("Executable"));
+            ui.add_space(12.0);
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Path")
+                        .size(13.0)
+                        .color(p.text_muted),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.elevate_path)
+                        .desired_width(f32::max(ui.available_width() - 50.0, 280.0))
+                        .margin(egui::vec2(12.0, 10.0))
+                        .hint_text("C:\\Path\\To\\application.exe"),
+                );
+            });
+
+            ui.add_space(12.0);
+            ui::drop_hint_frame(ui, p, !self.elevate_path.trim().is_empty());
+
+            ui.add_space(16.0);
+
+            if ui::primary_button(ui, p, "Launch Elevated", true).clicked() {
+                let msg = send_elevate_command(&self.elevate_path);
+                self.update_message_ok = !msg.to_lowercase().contains("fail");
+                self.update_message = Some(msg);
+            }
+        });
+    }
+
+    fn show_logs(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        ui.horizontal(|ui| {
+            ui.label(page_title("Audit Logs"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui::secondary_button(ui, p, "Refresh").clicked() {
+                    self.reload_logs();
+                }
+            });
+        });
+        ui.add_space(6.0);
+        ui.label(theme::muted_text("Recent execution decisions from enforce.log."));
+        ui.add_space(16.0);
+
+        egui::Frame::none()
+            .fill(p.bg_card)
+            .stroke(egui::Stroke::new(1.0, p.border_subtle))
+            .rounding(egui::Rounding::same(10.0))
+            .inner_margin(egui::Margin::same(12.0))
+            .show(ui, |ui| {
+                if self.logs.is_empty() {
+                    ui::empty_state(
+                        ui,
+                        p,
+                        "No log entries yet",
+                        "Enforcement events will appear here once the daemon writes to enforce.log.",
+                    );
+                    return;
+                }
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .max_height(400.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("logs_grid")
+                            .striped(true)
+                            .spacing([24.0, 10.0])
+                            .min_col_width(120.0)
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("TIMESTAMP")
+                                        .size(11.0)
+                                        .color(p.text_muted),
+                                );
+                                ui.label(
+                                    egui::RichText::new("ACTION")
+                                        .size(11.0)
+                                        .color(p.text_muted),
+                                );
+                                ui.label(
+                                    egui::RichText::new("DETAILS")
+                                        .size(11.0)
+                                        .color(p.text_muted),
+                                );
+                                ui.end_row();
+
+                                for log in &self.logs {
+                                    let action_color = match log.action.as_str() {
+                                        "BLOCK" => p.danger,
+                                        "ALLOW" => p.success,
+                                        _ => p.text_secondary,
+                                    };
+
+                                    ui.label(
+                                        egui::RichText::new(&log.time)
+                                            .size(13.0)
+                                            .color(p.text_muted)
+                                            .family(egui::FontFamily::Monospace),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(&log.action)
+                                            .strong()
+                                            .size(13.0)
+                                            .color(action_color),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(&log.message)
+                                            .size(13.0)
+                                            .color(p.text_primary),
+                                    );
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            });
+    }
+}
+
+fn policy_card(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    title: &str,
+    body: impl FnOnce(&mut egui::Ui, &Palette),
+) {
+    card_frame(p).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(section_title(title));
+        ui.add_space(10.0);
+        body(ui, p);
+    });
+}
+
 // ============================================================================
-// IPC HELPER FUNCTIONS
+// IPC
 // ============================================================================
 
 fn to_wide(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 fn connect_to_daemon() -> Result<std::fs::File, ()> {
     let pipe_name = to_wide(r"\\.\pipe\voidcore_ipc");
     unsafe {
-        use windows::Win32::Foundation::INVALID_HANDLE_VALUE;
-        use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
         use windows::core::PCWSTR;
+        use windows::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
 
         let handle = CreateFileW(
             PCWSTR(pipe_name.as_ptr()),
-            0xC0000000, 
+            0xC0000000,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
@@ -370,10 +633,10 @@ fn fetch_daemon_status() -> (String, String) {
         } else {
             let _ = file.write_all(b"\n");
         }
-        
+
         let _ = file.write_all(b"status\n");
         let _ = file.flush();
-        
+
         let mut reader = BufReader::new(file);
         let mut resp = String::new();
         if reader.read_line(&mut resp).is_ok() && resp.trim().starts_with('{') {
@@ -394,31 +657,33 @@ fn send_update_command() -> String {
         } else {
             let _ = file.write_all(b"\n");
         }
-        
+
         let _ = file.write_all(b"update\n");
         let _ = file.flush();
-        return "Update requested. System daemon will hot-swap and reboot in ~15 seconds.".to_string();
+        return "Update requested. The daemon will hot-swap and reboot in ~15 seconds.".to_string();
     }
-    "Failed to reach daemon. Are you sure it is running?".to_string()
+    "Failed to reach daemon. Verify the VoidCore service is running.".to_string()
 }
 
 fn send_elevate_command(path: &str) -> String {
-    if path.trim().is_empty() { return "Please provide a valid executable path.".to_string(); }
+    if path.trim().is_empty() {
+        return "Please provide a valid executable path.".to_string();
+    }
     if let Ok(mut file) = connect_to_daemon() {
         if let Ok(token) = std::fs::read_to_string(r"C:\ProgramData\VoidCore\gui.token") {
             let _ = file.write_all(format!("TOKEN:{}\n", token.trim()).as_bytes());
         } else {
             let _ = file.write_all(b"\n");
         }
-        
+
         let _ = file.write_all(format!("elevate:{}\n", path).as_bytes());
         let _ = file.flush();
-        
+
         let mut reader = BufReader::new(file);
         let mut resp = String::new();
         if reader.read_line(&mut resp).is_ok() {
             return resp.trim().to_string();
         }
     }
-    "Failed to securely communicate with the background daemon.".to_string()
+    "Failed to communicate with the background daemon.".to_string()
 }
