@@ -226,7 +226,7 @@ fn capture_active_desktop() -> Result<Option<RgbaImage>, String> {
 fn lock_active_session() -> Result<(), String> {
     let _guard = ActiveUserGuard::new()?;
     unsafe {
-        use windows::Win32::System::WindowsProgramming::LockWorkStation;
+        use windows::Win32::UI::WindowsAndMessaging::LockWorkStation;
         LockWorkStation().map_err(|e| format!("LockWorkStation: {e}"))
     }
 }
@@ -238,8 +238,7 @@ struct ActiveUserGuard {
 impl ActiveUserGuard {
     fn new() -> Result<Self, String> {
         unsafe {
-            use windows::Win32::Foundation::CloseHandle;
-            use windows::Win32::Security::{ImpersonateLoggedOnUser, RevertToSelf};
+            use windows::Win32::Security::ImpersonateLoggedOnUser;
             use windows::Win32::System::RemoteDesktop::{
                 WTSGetActiveConsoleSessionId, WTSQueryUserToken,
             };
@@ -281,13 +280,13 @@ fn capture_input_desktop() -> Result<Option<RgbaImage>, String> {
         };
         use windows::Win32::System::StationsAndDesktops::{
             CloseDesktop, GetThreadDesktop, OpenInputDesktop, SetThreadDesktop,
-            DESKTOP_ENUMERATE, DESKTOP_READOBJECTS,
+            DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, DESKTOP_ENUMERATE, DESKTOP_READOBJECTS,
         };
         use windows::Win32::System::Threading::GetCurrentThreadId;
         use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
-        let access = DESKTOP_READOBJECTS | DESKTOP_ENUMERATE;
-        let desktop = OpenInputDesktop(0, false, access)
+        let access = DESKTOP_ACCESS_FLAGS(DESKTOP_READOBJECTS.0 | DESKTOP_ENUMERATE.0);
+        let desktop = OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, access)
             .map_err(|e| format!("OpenInputDesktop: {e}"))?;
         let old_desktop = GetThreadDesktop(GetCurrentThreadId())
             .map_err(|e| format!("GetThreadDesktop: {e}"))?;
