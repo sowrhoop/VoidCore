@@ -1,6 +1,4 @@
 // Rewritten service entrypoint managing SCM state and threads
-mod vision;
-
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -17,9 +15,6 @@ const SERVICE_NAME: &str = "VoidCoreDaemon";
 define_windows_service!(ffi_service_main, my_service_main);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if vision::try_run_snapshot_cli() {
-        return Ok(());
-    }
     if let Err(_) = service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
         let _ = logging::log_event("core", "WARN", "Running outside of SCM");
         run_service()?;
@@ -84,7 +79,6 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     service_impl_ipc::start_ipc_server(cfg_handle.clone());
     service_impl_updater::start_auto_updater(cfg_handle.clone());
     service_impl_enforce::start_enforcement(cfg_handle.clone());
-    vision::start_nsfw_guard();
 
     loop {
         std::thread::sleep(Duration::from_secs(60));

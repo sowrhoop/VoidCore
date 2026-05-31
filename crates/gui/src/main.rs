@@ -231,10 +231,8 @@ impl VoidCoreApp {
 
     fn reload_logs(&mut self) {
         const ENFORCE_LOG: &str = r"C:\ProgramData\VoidCore\logs\enforce.log";
-        const VISION_LOG: &str = r"C:\ProgramData\VoidCore\logs\vision.log";
 
         let mut entries = load_log_file(ENFORCE_LOG, "enforce", None);
-        entries.extend(load_log_file(VISION_LOG, "vision", Some(&["BLOCK"])));
 
         entries.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
         entries.truncate(150);
@@ -495,7 +493,7 @@ impl VoidCoreApp {
             });
             ui.add_space(4.0);
             ui.label(theme::muted_text(
-                "Merged stream from core, enforce, vision, ipc, and other VoidCore logs.",
+                "Merged stream from core, enforce, ipc, and other VoidCore logs.",
             ));
             ui.add_space(10.0);
 
@@ -683,7 +681,7 @@ impl VoidCoreApp {
         });
         ui.add_space(6.0);
         ui.label(theme::muted_text(
-            "Process enforcement (enforce.log) and NSFW blocks with scores (vision.log).",
+            "Process enforcement events from enforce.log.",
         ));
         ui.add_space(16.0);
 
@@ -698,7 +696,7 @@ impl VoidCoreApp {
                         ui,
                         p,
                         "No log entries yet",
-                        "Blocked or terminated events will appear here from enforce.log and vision.log.",
+                        "Blocked or terminated events will appear here from enforce.log.",
                     );
                     return;
                 }
@@ -740,10 +738,7 @@ impl VoidCoreApp {
                                         "ALLOW" => p.success,
                                         _ => p.text_secondary,
                                     };
-                                    let source_color = match log.source.as_str() {
-                                        "vision" => p.accent,
-                                        _ => p.text_muted,
-                                    };
+                                    let source_color = p.text_muted;
 
                                     ui.label(
                                         egui::RichText::new(&log.time)
